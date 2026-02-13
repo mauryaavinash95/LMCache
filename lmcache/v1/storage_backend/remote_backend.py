@@ -190,6 +190,7 @@ class RemoteBackend(StorageBackendInterface):
         with self.lock:
             self.put_tasks.discard(key)
 
+    @_lmcache_nvtx_annotate
     def submit_put_task(
         self,
         key: CacheEngineKey,
@@ -250,6 +251,7 @@ class RemoteBackend(StorageBackendInterface):
         with self.lock:
             self.put_tasks.difference_update(keys)
 
+    @_lmcache_nvtx_annotate
     def batched_submit_put_task(
         self,
         keys: Sequence[CacheEngineKey],
@@ -362,6 +364,7 @@ class RemoteBackend(StorageBackendInterface):
         self._interval_get_blocking_failed_count = 0
         return count
 
+    @_lmcache_nvtx_annotate
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],

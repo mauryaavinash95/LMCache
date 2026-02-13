@@ -385,6 +385,7 @@ class StorageManager:
             "StorageManager.put is deprecated and should not be called anymore"
         )
 
+    @_lmcache_nvtx_annotate
     def batched_put(
         self,
         keys: Sequence[CacheEngineKey],
@@ -481,6 +482,7 @@ class StorageManager:
                 return task
         return None
 
+    @_lmcache_nvtx_annotate
     def batched_get(
         self,
         keys: List[CacheEngineKey],

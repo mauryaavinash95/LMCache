@@ -13,7 +13,7 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
+from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.protocol import RemoteMetadata
@@ -281,6 +281,7 @@ class MooncakestoreConnector(RemoteConnector):
     def exists_sync(self, key: CacheEngineKey) -> bool:
         return self.store.is_exist(key.to_string())
 
+    @_lmcache_nvtx_annotate
     async def batched_get(
         self, keys: List[CacheEngineKey]
     ) -> List[Optional[MemoryObj]]:
@@ -315,6 +316,7 @@ class MooncakestoreConnector(RemoteConnector):
             num_hit_counts += 1
         return num_hit_counts
 
+    @_lmcache_nvtx_annotate
     async def _batch_get_into(
         self, keys: List[CacheEngineKey]
     ) -> List[Optional[MemoryObj]]:
@@ -396,6 +398,7 @@ class MooncakestoreConnector(RemoteConnector):
                 memory_objs[i].ref_count_down()  # type: ignore
             return [None] * len(keys)
 
+    @_lmcache_nvtx_annotate
     async def _batch_get_buffer(
         self, keys: List[CacheEngineKey]
     ) -> List[Optional[MemoryObj]]:
@@ -475,6 +478,7 @@ class MooncakestoreConnector(RemoteConnector):
         else:
             return None
 
+    @_lmcache_nvtx_annotate
     async def put(self, key: CacheEngineKey, memory_obj: MemoryObj):
         """
         Put operation with metadata-consistent handling.
@@ -494,6 +498,7 @@ class MooncakestoreConnector(RemoteConnector):
     def support_batched_put(self) -> bool:
         return True
 
+    @_lmcache_nvtx_annotate
     async def batched_put(
         self,
         keys: List[CacheEngineKey],
@@ -512,6 +517,7 @@ class MooncakestoreConnector(RemoteConnector):
         else:
             await self._batched_put_zero_copy(keys, memory_objs)
 
+    @_lmcache_nvtx_annotate
     async def _batched_put_zero_copy(
         self,
         keys: List[CacheEngineKey],
@@ -542,6 +548,7 @@ class MooncakestoreConnector(RemoteConnector):
                 "Timeout during batch_put_from; some decoders may redo prefill."
             )
 
+    @_lmcache_nvtx_annotate
     async def _batched_put_with_metadata(
         self,
         keys: List[CacheEngineKey],
@@ -550,6 +557,7 @@ class MooncakestoreConnector(RemoteConnector):
         for key, obj in zip(keys, memory_objs, strict=False):
             await self._put_with_metadata(key.to_string(), obj)
 
+    @_lmcache_nvtx_annotate
     async def _put_without_metadata(self, key_str: str, memory_obj: MemoryObj):
         """
         Zero-copy put using put_from when metadata is not stored remotely.
@@ -583,6 +591,7 @@ class MooncakestoreConnector(RemoteConnector):
             )
             raise
 
+    @_lmcache_nvtx_annotate
     async def _put_with_metadata(self, key_str: str, memory_obj: MemoryObj):
         """
         Put using put_parts when metadata is stored remotely.
