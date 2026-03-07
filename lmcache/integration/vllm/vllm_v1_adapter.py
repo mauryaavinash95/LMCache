@@ -1085,6 +1085,16 @@ class LMCacheConnectorV1Impl:
             return
 
         if self.use_layerwise:
+            for layerwise_storer in self.layerwise_storers:
+                # next(layerwise_storer)
+                try:
+                    next(layerwise_storer)
+                except StopIteration:
+                    logger.debug(
+                        "Layerwise storer completed early during save_kv_layer; skipping."
+                    )
+
+            # unpin the kv caches according to req_id
             for request in connector_metadata.requests:
                 layerwise_storer = self._layerwise_save_storers.pop(
                     request.req_id, None

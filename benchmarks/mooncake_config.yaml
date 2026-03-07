@@ -1,0 +1,23 @@
+chunk_size: 1024
+local_cpu: false
+max_local_cpu_size: 5.0
+
+# Point LMCache to the Real IP
+remote_url: "mooncakestore://10.17.6.201:50051"
+remote_serde: "naive"
+
+extra_config:
+  # Identity
+  local_hostname: "10.17.6.201"
+  
+  # Discovery (Note the explicit HTTP scheme and IP)
+  metadata_server: "http://10.17.6.201:8080"
+  master_server_address: "10.17.6.201:50051"
+  
+  # Storage
+  storage_root_dir: "/vast/users/amaurya/scratch/mooncake_data"
+  
+  # Optimizations
+  protocol: "tcp"
+  local_buffer_size: 0
+  save_chunk_meta: false

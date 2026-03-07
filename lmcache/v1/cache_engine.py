@@ -542,16 +542,16 @@ class LMCacheEngine:
         tot_time = store_stats.time_to_store()
 
         logger.info(
-            "[req_id=%s] Stored %d out of total %d tokens. "
-            "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s; "
-            "offload_time: %.4f ms, put_time: %.4f ms",
-            req_id,
+            "Stored %d out of total %d tokens. size: %.4f GB, cost %.4f ms, "
+            "throughput: %.4f GB/s; offload_time: %.4f ms, process_tokens_time: %.4f ms, from_gpu_time: %.4f ms, put_time: %.4f ms",
             tot_token_num,
             num_to_store_tokens,
             tot_kv_size / 1024**3,
             tot_time * 1000,
             tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
             (store_stats.process_tokens_time + store_stats.from_gpu_time) * 1000,
+            store_stats.process_tokens_time * 1000,
+            store_stats.from_gpu_time * 1000,
             store_stats.put_time * 1000,
         )
 
