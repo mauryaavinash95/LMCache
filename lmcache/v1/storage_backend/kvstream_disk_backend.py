@@ -5,8 +5,9 @@ Uses the KVStream library (io_uring-based async I/O engine) to perform
 high-performance disk reads and writes for KV cache data, replacing the
 Python open()/write()/read() calls used by LocalDiskBackend.
 
-This backend is an **alternative** to LocalDiskBackend, activated via
-the ``kvstream_disk`` config key.
+This backend replaces LocalDiskBackend when ``kvstream_enable: true``
+is set in the LMCache config.  It reuses the ``local_disk`` directory
+and ``max_local_disk_size`` capacity settings.
 """
 
 # Standard
@@ -48,8 +49,8 @@ class KVStreamDiskBackend(StorageBackendInterface):
     overhead used by ``LocalDiskBackend`` and lets the kernel batch and
     reorder I/O for higher throughput.
 
-    Activated when ``config.kvstream_disk`` is set to a directory path and
-    ``config.kvstream_max_disk_size > 0``.
+    Activated when ``config.kvstream_enable`` is ``True`` and
+    ``config.local_disk`` is set with ``config.max_local_disk_size > 0``.
     """
 
     def __init__(
@@ -86,8 +87,8 @@ class KVStreamDiskBackend(StorageBackendInterface):
         self.disk_lock = threading.Lock()
 
         # -- Directory ---------------------------------------------------
-        assert config.kvstream_disk is not None
-        self.path: str = config.kvstream_disk
+        assert config.local_disk is not None
+        self.path: str = config.local_disk
         if not os.path.exists(self.path):
             os.makedirs(self.path)
             logger.info("Created KVStream disk cache directory: %s", self.path)
@@ -95,7 +96,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
         self.loop = loop
 
         # -- Capacity tracking -------------------------------------------
-        self.max_cache_size: int = int(config.kvstream_max_disk_size * 1024**3)
+        self.max_cache_size: int = int(config.max_local_disk_size * 1024**3)
         self.current_cache_size: float = 0.0
         self.usage: int = 0
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()

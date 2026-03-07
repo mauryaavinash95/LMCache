@@ -75,15 +75,10 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": _parse_local_disk,
     },
     "max_local_disk_size": {"type": float, "default": 0.0, "env_converter": float},
-    "kvstream_disk": {
-        "type": Optional[str],
-        "default": None,
-        "env_converter": str,
-    },
-    "kvstream_max_disk_size": {
-        "type": float,
-        "default": 0.0,
-        "env_converter": float,
+    "kvstream_enable": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
     },
     "kvstream_chunk_size_kb": {
         "type": int,
