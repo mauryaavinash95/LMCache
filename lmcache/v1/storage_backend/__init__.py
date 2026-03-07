@@ -209,6 +209,32 @@ def CreateStorageBackends(
         backend_name = str(local_disk_backend)
         storage_backends[backend_name] = local_disk_backend
 
+    # KVStream Disk Backend (io_uring-based async I/O alternative to
+    # LocalDiskBackend).  Activated by setting kvstream_disk to a directory
+    # path and kvstream_max_disk_size > 0.
+    if (
+        config.kvstream_disk
+        and config.kvstream_max_disk_size > 0
+        and "KVStreamDiskBackend" not in _skip
+    ):
+        # First Party
+        from lmcache.v1.storage_backend.kvstream_disk_backend import (
+            KVStreamDiskBackend,
+        )
+
+        assert local_cpu_backend is not None, (
+            "KVStreamDiskBackend requires LocalCPUBackend"
+        )
+        kvstream_disk_backend = KVStreamDiskBackend(
+            config,
+            loop,
+            local_cpu_backend,
+            dst_device,
+            lmcache_worker,
+            metadata,
+        )
+        storage_backends[str(kvstream_disk_backend)] = kvstream_disk_backend
+
     if config.gds_path is not None and "GdsBackend" not in _skip:
         gds_backend = GdsBackend(
             config,
