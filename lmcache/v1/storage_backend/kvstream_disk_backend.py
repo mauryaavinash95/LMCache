@@ -5,15 +5,24 @@ Uses the KVStream library (io_uring-based async I/O engine) to perform
 high-performance disk reads and writes for KV cache data, replacing the
 Python open()/write()/read() calls used by LocalDiskBackend.
 
-This backend replaces LocalDiskBackend when ``kvstream_enable: true``
-is set in the LMCache config.  It reuses the ``local_disk`` directory
-and ``max_local_disk_size`` capacity settings.
+Architecture
+~~~~~~~~~~~~
+KVStream internally maintains **two** io_uring engines (read and write) that
+share a single FD cache (files opened ``O_RDWR | O_CREAT``).  This backend
+submits writes as non-blocking SQEs on the main thread and periodically
+*drains* completed write notifications — no background Python threads are
+used for the write path.
+
+Reads use ``wait_one`` / ``wait_all`` with ``IOQueue.READ`` so they never
+block on outstanding writes.
+
+Activated when ``config.kvstream_enable`` is ``True`` and
+``config.local_disk`` points to a directory.
 """
 
 # Standard
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
-import logging
 import os
 import threading
 import time
@@ -40,17 +49,30 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Type alias for inflight write bookkeeping entries.
+# (key, memory_obj, size, shape, dtype, fmt, cached_positions, callback)
+_InflightEntry = tuple[
+    CacheEngineKey,
+    MemoryObj,
+    int,
+    "torch.Size",
+    "torch.dtype",
+    MemoryFormat,
+    Optional["torch.Tensor"],
+    Optional[Callable[[CacheEngineKey], None]],
+]
+
 
 class KVStreamDiskBackend(StorageBackendInterface):
     """Disk backend using KVStream (io_uring) for async I/O.
 
     KVStream submits I/O operations via io_uring and processes completions
-    on a dedicated background thread.  This eliminates the Python thread-pool
-    overhead used by ``LocalDiskBackend`` and lets the kernel batch and
-    reorder I/O for higher throughput.
+    on dedicated C++ background threads (one per engine).  The Python write
+    path is **drain-based**: ``batched_submit_put_task`` submits SQEs on the
+    main thread and returns immediately; completed writes are reaped by
+    ``_drain_completed()`` on subsequent calls or at ``close()``.
 
-    Activated when ``config.kvstream_enable`` is ``True`` and
-    ``config.local_disk`` is set with ``config.max_local_disk_size > 0``.
+    Activated when ``config.kvstream_enable`` is ``True``.
     """
 
     def __init__(
@@ -66,7 +88,8 @@ class KVStreamDiskBackend(StorageBackendInterface):
 
         Args:
             config: LMCache engine configuration.
-            loop: The asyncio event loop for scheduling async tasks.
+            loop: The asyncio event loop (kept for read-path
+                ``asyncio.to_thread`` usage only).
             local_cpu_backend: CPU memory allocator backend.
             dst_device: Target device string (e.g. ``"cuda:0"``).
             lmcache_worker: Optional cache controller worker for ADMIT/EVICT
@@ -93,6 +116,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
             os.makedirs(self.path)
             logger.info("Created KVStream disk cache directory: %s", self.path)
 
+        # Event loop — only used for the read path (asyncio.to_thread)
         self.loop = loop
 
         # -- Capacity tracking -------------------------------------------
@@ -112,6 +136,11 @@ class KVStreamDiskBackend(StorageBackendInterface):
         self._hash_counter: int = 0
         self._counter_lock = threading.Lock()
 
+        # -- Inflight writes (drain-based bookkeeping) -------------------
+        # Maps io_hash -> bookkeeping tuple for writes that have been
+        # submitted to C++ but not yet drained as completed/failed.
+        self._inflight: dict[str, _InflightEntry] = {}
+
         # -- KVStream engine ---------------------------------------------
         extra = config.extra_config or {}
         chunk_size_kb: int = config.kvstream_chunk_size_kb
@@ -121,8 +150,9 @@ class KVStreamDiskBackend(StorageBackendInterface):
         try_odirect: bool = bool(extra.get("kvstream_try_odirect", True))
 
         try:
-            from kvstream import kvstream_core  
+            from kvstream import kvstream_core
 
+            self.kvstream_core = kvstream_core
             self.engine = kvstream_core.KVStream(
                 chunk_size_kb=chunk_size_kb,
                 queue_depth=queue_depth,
@@ -146,6 +176,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
                 "KVStreamDiskBackend."
             )
 
+        # -- Batched message sender (controller ADMIT/EVICT msgs) --------
         self.batched_msg_sender: Optional[BatchedMessageSender] = None
         if lmcache_worker and metadata is not None:
             self.batched_msg_sender = BatchedMessageSender(
@@ -176,7 +207,9 @@ class KVStreamDiskBackend(StorageBackendInterface):
         Returns:
             Absolute path for the cached file.
         """
-        return os.path.join(self.path, key.to_string().replace("/", "-") + ".bin")
+        return os.path.join(
+            self.path, key.to_string().replace("/", "-") + ".bin"
+        )
 
     def _next_io_hash(self, key: CacheEngineKey, op: str) -> str:
         """Generate a globally unique hash for a KVStream I/O operation.
@@ -264,8 +297,9 @@ class KVStreamDiskBackend(StorageBackendInterface):
     def touch_cache(self) -> None:
         """Update cache recency for keys accumulated during lookup.
 
-        Keys are processed in reverse order (suffix-to-prefix → prefix-to-suffix)
-        so that the most recently accessed key ends up at the MRU position.
+        Keys are processed in reverse order (suffix-to-prefix to
+        prefix-to-suffix) so that the most recently accessed key ends up
+        at the MRU position.
         """
         with self.disk_lock:
             for key in reversed(self.keys_in_request):
@@ -394,7 +428,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
             )
 
     # ------------------------------------------------------------------ #
-    #  Put (write) path                                                    #
+    #  Put-task tracking helpers                                           #
     # ------------------------------------------------------------------ #
 
     def _insert_put_task(self, key: CacheEngineKey) -> None:
@@ -420,157 +454,118 @@ class KVStreamDiskBackend(StorageBackendInterface):
                     "KVStream: put task for %s not found during removal", key
                 )
 
-    @_lmcache_nvtx_annotate
-    @torch.inference_mode()
-    def _sync_save_one(
-        self,
-        key: CacheEngineKey,
-        io_hash: str,
-        raw_tensor: torch.Tensor,
-        path: str,
-        size: int,
-        shape: torch.Size,
-        dtype: torch.dtype,
-        fmt: MemoryFormat,
-        cached_positions: Optional[torch.Tensor],
-        memory_obj: MemoryObj,
-        on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
-    ) -> None:
-        """Synchronously save one entry via KVStream and do bookkeeping.
+    # ------------------------------------------------------------------ #
+    #  Drain-based write completion bookkeeping                            #
+    # ------------------------------------------------------------------ #
 
-        Called from :meth:`_sync_batch_save` after ``wait_all()`` returns
-        **or** as a per-entry fallback.  This method must NOT be called
-        on the asyncio event loop thread.
+    def _drain_completed(self) -> None:
+        """Poll the C++ write engine for completed and failed writes.
 
-        Args:
-            key: Cache key.
-            io_hash: Unique KVStream operation hash.
-            raw_tensor: The raw uint8 tensor whose bytes were written.
-            path: Destination file path.
-            size: Physical byte size written.
-            shape: Logical tensor shape (for metadata).
-            dtype: Tensor dtype (for metadata).
-            fmt: Memory format (for metadata).
-            cached_positions: Optional position tensor.
-            memory_obj: The MemoryObj (for ref-count management).
-            on_complete_callback: Optional per-key completion callback.
+        For each completed write hash:
+          1. ``ref_count_down`` the ``MemoryObj`` (release the buffer).
+          2. ``insert_key`` to register metadata.
+          3. ``_remove_put_task`` to allow future puts for the same key.
+          4. Invoke the ``on_complete_callback`` if provided.
+
+        For each failed write hash:
+          1. ``ref_count_down`` the ``MemoryObj``.
+          2. ``_remove_put_task``.
+          3. Roll back ``current_cache_size`` (the space was pre-reserved).
+
+        This is called at the *start* of each ``batched_submit_put_task``
+        and once more during ``close()``.
         """
-        self.usage += size
-        self.stats_monitor.update_local_storage_usage(self.usage)
-
-        # ref_count_down before insert_key (matches LocalDiskBackend
-        # ordering for mem-leak test compatibility)
-        memory_obj.ref_count_down()
-
-        self.insert_key(
-            key, size, shape, dtype, fmt, cached_positions=cached_positions
-        )
-
-        self._remove_put_task(key)
-
-        if on_complete_callback is not None:
-            try:
-                on_complete_callback(key)
-            except Exception as e:
+        # -- Drain completions --
+        completed_hashes = self.engine.drain_completed()
+        for io_hash in completed_hashes:
+            entry = self._inflight.pop(io_hash, None)
+            if entry is None:
                 logger.warning(
-                    "on_complete_callback failed for key %s: %s", key, e
+                    "KVStream: drained completed hash %s with no "
+                    "inflight entry",
+                    io_hash,
                 )
+                continue
 
-    def _sync_batch_save(
-        self,
-        entries: list[
-            tuple[
-                CacheEngineKey,
-                str,
-                torch.Tensor,
-                str,
-                int,
-                torch.Size,
-                torch.dtype,
-                MemoryFormat,
-                Optional[torch.Tensor],
-                MemoryObj,
-                Optional[Callable[[CacheEngineKey], None]],
-            ]
-        ],
-    ) -> None:
-        """Submit all saves to KVStream, wait for completion, then bookkeep.
-
-        This runs in a worker thread (via ``asyncio.to_thread``).
-
-        1. Calls ``engine.save()`` for each entry (non-blocking SQE
-           submission).
-        2. Calls ``engine.wait_all()`` once to block until every SQE
-           completes.
-        3. Runs per-entry bookkeeping (insert_key, ref_count_down, etc.).
-
-        Args:
-            entries: List of tuples, one per KV chunk to write.  Each tuple
-                contains ``(key, io_hash, raw_tensor, path, size, shape,
-                dtype, fmt, cached_positions, memory_obj,
-                on_complete_callback)``.
-        """
-        start_time = time.time()
-
-        # Step 1: submit all saves (non-blocking)
-        for entry in entries:
             (
                 key,
-                io_hash,
-                raw_tensor,
-                path,
+                memory_obj,
+                size,
+                shape,
+                dtype,
+                fmt,
+                cached_positions,
+                on_complete_callback,
+            ) = entry
+
+            self.usage += size
+            self.stats_monitor.update_local_storage_usage(self.usage)
+
+            # ref_count_down before insert_key (matches LocalDiskBackend
+            # ordering for mem-leak test compatibility)
+            memory_obj.ref_count_down()
+
+            self.insert_key(
+                key,
+                size,
+                shape,
+                dtype,
+                fmt,
+                cached_positions=cached_positions,
+            )
+
+            self._remove_put_task(key)
+
+            if on_complete_callback is not None:
+                try:
+                    on_complete_callback(key)
+                except Exception as e:
+                    logger.warning(
+                        "on_complete_callback failed for key %s: %s", key, e
+                    )
+
+        # -- Drain failures --
+        failed_hashes = self.engine.drain_failed()
+        for io_hash in failed_hashes:
+            entry = self._inflight.pop(io_hash, None)
+            if entry is None:
+                logger.warning(
+                    "KVStream: drained failed hash %s with no "
+                    "inflight entry",
+                    io_hash,
+                )
+                continue
+
+            (
+                key,
+                memory_obj,
                 size,
                 _shape,
                 _dtype,
                 _fmt,
-                _cached_pos,
-                _mem_obj,
-                _cb,
+                _cached_positions,
+                _on_complete_callback,
             ) = entry
-            self.engine.save(io_hash, raw_tensor, path, 0)
 
-        # Step 2: block until all I/O completes
-        self.engine.wait_all()
-
-        elapsed = time.time() - start_time
-        total_bytes = sum(e[4] for e in entries)
-        if elapsed > 0:
-            logger.debug(
-                "KVStream batch save: %d entries, %d bytes, %.2f MB/s",
-                len(entries),
-                total_bytes,
-                total_bytes / elapsed / 1e6,
-            )
-
-        # Step 3: per-entry bookkeeping
-        for entry in entries:
-            (
+            logger.error(
+                "KVStream: write failed for key %s (io_hash=%s)",
                 key,
                 io_hash,
-                raw_tensor,
-                path,
-                size,
-                shape,
-                dtype,
-                fmt,
-                cached_positions,
-                memory_obj,
-                on_complete_callback,
-            ) = entry
-            self._sync_save_one(
-                key,
-                io_hash,
-                raw_tensor,
-                path,
-                size,
-                shape,
-                dtype,
-                fmt,
-                cached_positions,
-                memory_obj,
-                on_complete_callback,
             )
 
+            memory_obj.ref_count_down()
+            self._remove_put_task(key)
+
+            # Roll back the pre-reserved capacity
+            with self.disk_lock:
+                self.current_cache_size -= size
+
+    # ------------------------------------------------------------------ #
+    #  Put (write) path — drain-based, no background threads               #
+    # ------------------------------------------------------------------ #
+
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
     def batched_submit_put_task(
         self,
         keys: Sequence[CacheEngineKey],
@@ -580,9 +575,13 @@ class KVStreamDiskBackend(StorageBackendInterface):
     ) -> None:
         """Submit a batch of KV chunks for async disk write via KVStream.
 
-        For each key, performs dedup checking, eviction if needed, and
-        ref-count management.  Then submits all saves as a single io_uring
-        batch and blocks (in a background thread) until all complete.
+        **Write path flow (all on the calling thread, no background threads):**
+
+        1. ``_drain_completed()`` — reap any previously finished writes.
+        2. Per-key dedup check, eviction loop, capacity reservation.
+        3. ``ref_count_up`` + ``engine.save()`` per key (non-blocking SQE
+           submission) + record in ``_inflight``.
+        4. Return immediately.
 
         Args:
             keys: Cache keys for the KV chunks.
@@ -592,8 +591,10 @@ class KVStreamDiskBackend(StorageBackendInterface):
                 that key's disk write completes.  Exceptions are caught and
                 logged.
         """
-        entries: list[tuple] = []
+        # Step 1: drain previously completed/failed writes
+        self._drain_completed()
 
+        # Step 2-3: process each key
         for key, memory_obj in zip(keys, objs, strict=False):
             assert memory_obj.tensor is not None
 
@@ -609,7 +610,8 @@ class KVStreamDiskBackend(StorageBackendInterface):
             evict_success = True
             with self.disk_lock:
                 while (
-                    self.current_cache_size + required_size > self.max_cache_size
+                    self.current_cache_size + required_size
+                    > self.max_cache_size
                 ):
                     evict_keys = self.cache_policy.get_evict_candidates(
                         self.dict, num_candidates=1
@@ -635,9 +637,13 @@ class KVStreamDiskBackend(StorageBackendInterface):
                 continue
 
             self.cache_policy.update_on_put(key)
+
+            # ref_count_up BEFORE returning — storage_manager does
+            # ref_count_down after batched_submit_put_task returns, so
+            # the buffer must stay alive while the async write is in-flight.
             memory_obj.ref_count_up()
 
-            # Collect entry for batch submission
+            # Collect metadata for inflight bookkeeping
             raw_tensor = memory_obj.raw_tensor
             path = self._key_to_path(key)
             size = memory_obj.get_physical_size()
@@ -646,30 +652,22 @@ class KVStreamDiskBackend(StorageBackendInterface):
             fmt = memory_obj.metadata.fmt
             cached_positions = memory_obj.metadata.cached_positions
 
-            entries.append(
-                (
-                    key,
-                    self._next_io_hash(key, "save"),
-                    raw_tensor,
-                    path,
-                    size,
-                    shape,
-                    dtype,
-                    fmt,
-                    cached_positions,
-                    memory_obj,
-                    on_complete_callback,
-                )
+            io_hash = self._next_io_hash(key, "save")
+
+            # Submit non-blocking SQE to the C++ write engine
+            self.engine.save(io_hash, raw_tensor, path, 0)
+
+            # Record in inflight dict for later drain
+            self._inflight[io_hash] = (
+                key,
+                memory_obj,
+                size,
+                shape,
+                dtype,
+                fmt,
+                cached_positions,
+                on_complete_callback,
             )
-
-        if not entries:
-            return
-
-        # Schedule the batch save on a background thread
-        asyncio.run_coroutine_threadsafe(
-            asyncio.to_thread(self._sync_batch_save, entries),
-            self.loop,
-        )
 
     # ------------------------------------------------------------------ #
     #  Get (read) path                                                     #
@@ -711,13 +709,13 @@ class KVStreamDiskBackend(StorageBackendInterface):
             "Memory allocation failed during KVStream disk load."
         )
 
-        # Submit load and wait
+        # Submit load and wait (READ engine only)
         raw_tensor = memory_obj.raw_tensor
         io_hash = self._next_io_hash(key, "load")
 
         start_time = time.time()
         self.engine.load(io_hash, raw_tensor, path, 0)
-        self.engine.wait_one(io_hash)
+        self.engine.wait_one(io_hash, self.kvstream_core.IOQueue.READ)
         elapsed = time.time() - start_time
 
         size = memory_obj.get_physical_size()
@@ -743,7 +741,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
         keys: list[CacheEngineKey],
         memory_objs: list[MemoryObj],
     ) -> list[MemoryObj]:
-        """Block until all KVStream loads complete, then do bookkeeping.
+        """Block until all KVStream reads complete, then do bookkeeping.
 
         Runs in a worker thread via ``asyncio.to_thread()``.
 
@@ -756,7 +754,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
             The same ``memory_objs`` list, now populated with data.
         """
         start_time = time.time()
-        self.engine.wait_all()
+        self.engine.wait_all(self.kvstream_core.IOQueue.READ)
         elapsed = time.time() - start_time
 
         total_bytes = sum(m.get_physical_size() for m in memory_objs)
@@ -839,10 +837,10 @@ class KVStreamDiskBackend(StorageBackendInterface):
             io_hashes.append(io_hash)
             load_entries.append((io_hash, memory_obj.raw_tensor, path, 0))
 
-        # Submit all loads (non-blocking SQE submission)
+        # Submit all loads (non-blocking SQE submission to read engine)
         self.engine.load_batch(load_entries)
 
-        # Wait for completion on a background thread
+        # Wait for completion on a background thread (READ engine only)
         return await asyncio.to_thread(
             self._sync_batch_load, io_hashes, keys, mem_objs
         )
@@ -862,10 +860,18 @@ class KVStreamDiskBackend(StorageBackendInterface):
     def close(self) -> None:
         """Shut down the KVStream engine and flush pending messages.
 
-        Drains all in-flight I/O operations, then tears down the
-        io_uring ring and fd cache.
+        1. Calls ``engine.shutdown()`` which internally waits for all
+           pending ops on both read and write engines, then tears down
+           the io_uring rings and closes the FD cache.
+        2. Calls ``_drain_completed()`` one final time to do remaining
+           ``ref_count_down`` / ``insert_key`` bookkeeping for any writes
+           that completed during shutdown.
+        3. Closes the batched message sender.
         """
+        self.engine.shutdown()
+        self._drain_completed()
+
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
-        self.engine.shutdown()
+
         logger.info("KVStreamDiskBackend closed.")
