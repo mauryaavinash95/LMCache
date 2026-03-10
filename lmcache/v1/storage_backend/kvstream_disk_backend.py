@@ -64,6 +64,7 @@ _InflightEntry = tuple[
 ]
 
 
+
 class KVStreamDiskBackend(StorageBackendInterface):
     """Disk backend using KVStream (io_uring) for async I/O.
 
@@ -154,9 +155,6 @@ class KVStreamDiskBackend(StorageBackendInterface):
         max_fds: int = int(extra.get("kvstream_max_fds", 4096))
         max_retries: int = int(extra.get("kvstream_max_retries", 10))
         try_odirect: bool = bool(extra.get("kvstream_try_odirect", True))
-        max_concurrent_writes: int = int(
-            extra.get("kvstream_max_concurrent_writes", 32)
-        )
 
         try:
             from kvstream import kvstream_core
@@ -168,18 +166,16 @@ class KVStreamDiskBackend(StorageBackendInterface):
                 max_fds_open=max_fds,
                 try_using_odirect=try_odirect,
                 max_retries=max_retries,
-                max_concurrent_writes=max_concurrent_writes,
             )
             logger.info(
                 "KVStream engine initialized: chunk_size_kb=%d, "
                 "queue_depth=%d, max_fds=%d, try_odirect=%s, "
-                "max_retries=%d, max_concurrent_writes=%d",
+                "max_retries=%d",
                 chunk_size_kb,
                 queue_depth,
                 max_fds,
                 try_odirect,
                 max_retries,
-                max_concurrent_writes,
             )
         except ImportError:
             raise ImportError(
@@ -640,13 +636,15 @@ class KVStreamDiskBackend(StorageBackendInterface):
     ) -> None:
         """Submit a batch of KV chunks for async disk write via KVStream.
 
-        **Write path flow (all on the calling thread, no background threads):**
+        **Write path flow (all on the calling thread, no blocking):**
 
         1. ``_drain_completed()`` — reap any previously finished writes.
         2. Per-key dedup check, eviction loop, capacity reservation.
-        3. ``ref_count_up`` + ``engine.save()`` per key (non-blocking SQE
-           submission) + record in ``_inflight``.
-        4. Return immediately.
+        3. ``ref_count_up`` + ``engine.save()`` per key — the C++ engine
+           queues entries internally and a background flushing thread
+           submits them to io_uring, absorbing any SQ ring backpressure.
+        4. Record in ``_inflight`` for later drain bookkeeping.
+        5. Return immediately.
 
         Args:
             keys: Cache keys for the KV chunks.
@@ -719,7 +717,10 @@ class KVStreamDiskBackend(StorageBackendInterface):
 
             io_hash = self._next_io_hash(key, "save")
 
-            # Submit non-blocking SQE to the C++ write engine
+            # Submit non-blocking SQE to the C++ write engine.
+            # The C++ engine queues the entry internally and a background
+            # flushing thread submits it to io_uring, absorbing any
+            # backpressure from a full SQ ring.
             self.engine.save(io_hash, raw_tensor, path, 0)
 
             # Record in inflight dict for later drain
@@ -926,9 +927,10 @@ class KVStreamDiskBackend(StorageBackendInterface):
         """Shut down the KVStream engine and flush pending messages.
 
         1. Stops the background drain thread.
-        2. Calls ``engine.shutdown()`` which internally waits for all
-           pending ops on both read and write engines, then tears down
-           the io_uring rings and closes the FD cache.
+        2. Calls ``engine.shutdown()`` which internally drains the
+           submit queue, waits for all pending ops on both read and
+           write engines, then tears down the io_uring rings and
+           closes the FD cache.
         3. Calls ``_drain_completed()`` one final time to do remaining
            ``ref_count_down`` / ``insert_key`` bookkeeping for any writes
            that completed during shutdown.
