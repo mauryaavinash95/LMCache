@@ -80,11 +80,6 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
-    "kvstream_chunk_size_kb": {
-        "type": int,
-        "default": 4096,
-        "env_converter": int,
-    },
     "remote_url": {
         "type": Optional[str],
         "default": None,

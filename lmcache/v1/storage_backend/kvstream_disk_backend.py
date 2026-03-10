@@ -143,8 +143,8 @@ class KVStreamDiskBackend(StorageBackendInterface):
 
         # -- KVStream engine ---------------------------------------------
         extra = config.extra_config or {}
-        chunk_size_kb: int = config.kvstream_chunk_size_kb
-        queue_depth: int = int(extra.get("kvstream_queue_depth", 1024))
+        chunk_size_kb: int = int(extra.get("kvstream_chunk_size_kb", 4096))
+        queue_depth: int = int(extra.get("kvstream_queue_depth", 32768))
         max_fds: int = int(extra.get("kvstream_max_fds", 4096))
         max_retries: int = int(extra.get("kvstream_max_retries", 10))
         try_odirect: bool = bool(extra.get("kvstream_try_odirect", True))
