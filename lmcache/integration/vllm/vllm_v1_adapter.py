@@ -37,6 +37,7 @@ from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
 from lmcache.v1.cache_engine import LMCacheEngine
+from lmcache.v1.hash_tracer import RequestHashTracer
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
@@ -805,6 +806,41 @@ class LMCacheConnectorV1Impl:
             )
             token_mask[:masked_token_count] = False
 
+            # Hash tracing: create tracer and compute all hashes
+            _tracer = RequestHashTracer(
+                req_id=request.req_id,
+                chunk_size=self._lmcache_chunk_size,
+            )
+            _all_keys: list = [
+                key
+                for _, _, key in
+                self.lmcache_engine.token_database.process_tokens(
+                    tokens=tokens,
+                    request_configs=request.request_configs,
+                )
+            ]
+            _all_hashes = [k.chunk_hash for k in _all_keys]
+            _tracer.set_all_hashes(_all_hashes, len(tokens))
+            _tracer.set_vllm_gpu_prefix(
+                request.load_spec.vllm_cached_tokens,
+            )
+
+            # Probe each backend for every hash (independent of
+            # prefix-chain contiguity) to detect orphaned presence.
+            _sm = self.lmcache_engine.storage_manager
+            if _sm is not None:
+                _tier_presence = {}
+                for _key in _all_keys:
+                    _tiers = []
+                    for _bn, _be in _sm.get_active_storage_backends():
+                        if _be.contains(_key, pin=False):
+                            _tiers.append(_bn)
+                    if _tiers:
+                        _tier_presence[_key.chunk_hash] = _tiers
+                _tracer.set_tier_presence(_tier_presence)
+
+            self.lmcache_engine.hash_tracers[request.req_id] = _tracer
+
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
             if self.use_layerwise:
                 if idx == last_idx:
@@ -1118,6 +1154,12 @@ class LMCacheConnectorV1Impl:
             if (
                 save_spec is None or not save_spec.can_save
             ) and self.kv_role != "kv_producer":
+                # Hash tracing: emit for load-only requests (no store)
+                _tracer = self.lmcache_engine.hash_tracers.pop(
+                    request.req_id, None
+                )
+                if _tracer is not None:
+                    _tracer.emit()
                 continue
 
             token_ids = request.token_ids
@@ -1137,6 +1179,12 @@ class LMCacheConnectorV1Impl:
                 )
 
             if skip_leading_tokens == len(token_ids):
+                # Hash tracing: emit for skipped-store requests
+                _tracer = self.lmcache_engine.hash_tracers.pop(
+                    request.req_id, None
+                )
+                if _tracer is not None:
+                    _tracer.emit()
                 continue  # skip this request
             # Align to lmcache chunk size
             skip_leading_tokens = (
@@ -1171,6 +1219,38 @@ class LMCacheConnectorV1Impl:
                     store_mask = store_mask[:aligned_token_len]
                     slot_mapping = slot_mapping[:aligned_token_len]
 
+            # Hash tracing: ensure tracer exists for store-only requests
+            if request.req_id not in self.lmcache_engine.hash_tracers:
+                _tracer = RequestHashTracer(
+                    req_id=request.req_id,
+                    chunk_size=self._lmcache_chunk_size,
+                )
+                _all_keys_store: list = [
+                    key
+                    for _, _, key in
+                    self.lmcache_engine.token_database.process_tokens(
+                        tokens=request.token_ids,
+                        request_configs=request.request_configs,
+                    )
+                ]
+                _all_hashes = [k.chunk_hash for k in _all_keys_store]
+                _tracer.set_all_hashes(_all_hashes, len(request.token_ids))
+
+                # Probe tier presence for store-only requests too
+                _sm = self.lmcache_engine.storage_manager
+                if _sm is not None:
+                    _tier_presence = {}
+                    for _key in _all_keys_store:
+                        _tiers = []
+                        for _bn, _be in _sm.get_active_storage_backends():
+                            if _be.contains(_key, pin=False):
+                                _tiers.append(_bn)
+                        if _tiers:
+                            _tier_presence[_key.chunk_hash] = _tiers
+                    _tracer.set_tier_presence(_tier_presence)
+
+                self.lmcache_engine.hash_tracers[request.req_id] = _tracer
+
             self.lmcache_engine.store(
                 token_ids,
                 mask=store_mask,
@@ -1181,6 +1261,13 @@ class LMCacheConnectorV1Impl:
                 request_configs=request.request_configs,
                 req_id=request.req_id,
             )
+
+            # Hash tracing: emit the consolidated JSON log
+            _tracer = self.lmcache_engine.hash_tracers.pop(
+                request.req_id, None
+            )
+            if _tracer is not None:
+                _tracer.emit()
 
             # Update skip_leading_tokens only on last rank to ensure
             # each PP stage stores its own KV cache

@@ -54,6 +54,7 @@ from lmcache.v1.memory_management import (  # noqa: E501
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.pin_monitor import PinMonitor
+from lmcache.v1.hash_tracer import RequestHashTracer
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
 from lmcache.v1.token_database import (
@@ -219,6 +220,9 @@ class LMCacheEngine:
 
         # Flag to indicate if initialization failed (irrecoverable error)
         self._init_failed = False
+
+        # Per-request hash lifecycle tracers (req_id -> tracer)
+        self.hash_tracers: Dict[str, RequestHashTracer] = {}
 
     def set_health_monitor(self, health_monitor: "HealthMonitor") -> None:
         """
