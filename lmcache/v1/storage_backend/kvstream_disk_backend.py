@@ -9,9 +9,10 @@ Architecture
 ~~~~~~~~~~~~
 KVStream internally maintains **two** io_uring engines (read and write) that
 share a single FD cache (files opened ``O_RDWR | O_CREAT``).  This backend
-submits writes as non-blocking SQEs on the main thread and periodically
-*drains* completed write notifications — no background Python threads are
-used for the write path.
+submits writes as non-blocking SQEs on the main thread.  A lightweight
+background drain thread polls completed write notifications every 50 ms
+(configurable via ``kvstream_drain_poll_interval_s``), freeing CPU memory
+buffers as soon as the kernel finishes writing them to disk.
 
 Reads use ``wait_one`` / ``wait_all`` with ``IOQueue.READ`` so they never
 block on outstanding writes.
@@ -69,8 +70,10 @@ class KVStreamDiskBackend(StorageBackendInterface):
     KVStream submits I/O operations via io_uring and processes completions
     on dedicated C++ background threads (one per engine).  The Python write
     path is **drain-based**: ``batched_submit_put_task`` submits SQEs on the
-    main thread and returns immediately; completed writes are reaped by
-    ``_drain_completed()`` on subsequent calls or at ``close()``.
+    main thread and returns immediately.  A background drain thread polls
+    ``_drain_completed()`` every 50 ms to free CPU memory buffers as soon
+    as writes finish, preventing buffer starvation when no new writes are
+    being submitted.
 
     Activated when ``config.kvstream_enable`` is ``True``.
     """
@@ -140,6 +143,9 @@ class KVStreamDiskBackend(StorageBackendInterface):
         # Maps io_hash -> bookkeeping tuple for writes that have been
         # submitted to C++ but not yet drained as completed/failed.
         self._inflight: dict[str, _InflightEntry] = {}
+        # Serializes _drain_completed() calls across the background
+        # drain thread and the main thread (batched_submit_put_task).
+        self._drain_lock = threading.Lock()
 
         # -- KVStream engine ---------------------------------------------
         extra = config.extra_config or {}
@@ -148,6 +154,9 @@ class KVStreamDiskBackend(StorageBackendInterface):
         max_fds: int = int(extra.get("kvstream_max_fds", 4096))
         max_retries: int = int(extra.get("kvstream_max_retries", 10))
         try_odirect: bool = bool(extra.get("kvstream_try_odirect", True))
+        max_concurrent_writes: int = int(
+            extra.get("kvstream_max_concurrent_writes", 32)
+        )
 
         try:
             from kvstream import kvstream_core
@@ -159,15 +168,18 @@ class KVStreamDiskBackend(StorageBackendInterface):
                 max_fds_open=max_fds,
                 try_using_odirect=try_odirect,
                 max_retries=max_retries,
+                max_concurrent_writes=max_concurrent_writes,
             )
             logger.info(
                 "KVStream engine initialized: chunk_size_kb=%d, "
-                "queue_depth=%d, max_fds=%d, try_odirect=%s, max_retries=%d",
+                "queue_depth=%d, max_fds=%d, try_odirect=%s, "
+                "max_retries=%d, max_concurrent_writes=%d",
                 chunk_size_kb,
                 queue_depth,
                 max_fds,
                 try_odirect,
                 max_retries,
+                max_concurrent_writes,
             )
         except ImportError:
             raise ImportError(
@@ -189,6 +201,27 @@ class KVStreamDiskBackend(StorageBackendInterface):
             logger.warning(
                 "KVStreamDiskBackend: controller message sender not initialized"
             )
+
+        # -- Background drain thread --------------------------------------
+        # Polls the C++ write engine for completed/failed writes every
+        # ``_DRAIN_POLL_INTERVAL_S`` seconds, ensuring buffers are freed
+        # promptly even when no new writes are being submitted.
+        self._drain_stop = threading.Event()
+        drain_interval: float = float(
+            extra.get("kvstream_drain_poll_interval_s", 0.05)
+        )
+        self._drain_thread = threading.Thread(
+            target=self._drain_loop,
+            args=(drain_interval,),
+            name="kvstream-drain",
+            daemon=True,
+        )
+        self._drain_thread.start()
+        logger.info(
+            "KVStream background drain thread started "
+            "(poll interval=%.3fs)",
+            drain_interval,
+        )
 
     # ------------------------------------------------------------------ #
     #  String / helpers                                                    #
@@ -455,6 +488,31 @@ class KVStreamDiskBackend(StorageBackendInterface):
                 )
 
     # ------------------------------------------------------------------ #
+    #  Background drain thread                                             #
+    # ------------------------------------------------------------------ #
+
+    def _drain_loop(self, interval: float) -> None:
+        """Background thread target: periodically drain completed writes.
+
+        Runs until ``_drain_stop`` is set.  Each iteration calls
+        ``_drain_completed()`` to free buffers held by finished
+        async writes, then sleeps for *interval* seconds.
+
+        This eliminates the deadlock where no new writes arrive
+        to trigger the drain, leaving completed-write buffers
+        pinned and starving the allocator.
+
+        Args:
+            interval: Seconds between drain polls.
+        """
+        while not self._drain_stop.is_set():
+            try:
+                self._drain_completed()
+            except Exception:
+                logger.exception("KVStream drain loop error")
+            self._drain_stop.wait(interval)
+
+    # ------------------------------------------------------------------ #
     #  Drain-based write completion bookkeeping                            #
     # ------------------------------------------------------------------ #
 
@@ -472,93 +530,100 @@ class KVStreamDiskBackend(StorageBackendInterface):
           2. ``_remove_put_task``.
           3. Roll back ``current_cache_size`` (the space was pre-reserved).
 
-        This is called at the *start* of each ``batched_submit_put_task``
-        and once more during ``close()``.
+        Called from three places:
+          1. The background drain thread (every ``kvstream_drain_poll_interval_s``).
+          2. The *start* of each ``batched_submit_put_task`` (belt-and-suspenders).
+          3. Once more during ``close()`` after ``engine.shutdown()``.
+
+        Thread-safe: serialized via ``_drain_lock``.
         """
-        # -- Drain completions --
-        completed_hashes = self.engine.drain_completed()
-        for io_hash in completed_hashes:
-            entry = self._inflight.pop(io_hash, None)
-            if entry is None:
-                logger.warning(
-                    "KVStream: drained completed hash %s with no "
-                    "inflight entry",
-                    io_hash,
-                )
-                continue
-
-            (
-                key,
-                memory_obj,
-                size,
-                shape,
-                dtype,
-                fmt,
-                cached_positions,
-                on_complete_callback,
-            ) = entry
-
-            self.usage += size
-            self.stats_monitor.update_local_storage_usage(self.usage)
-
-            # ref_count_down before insert_key (matches LocalDiskBackend
-            # ordering for mem-leak test compatibility)
-            memory_obj.ref_count_down()
-
-            self.insert_key(
-                key,
-                size,
-                shape,
-                dtype,
-                fmt,
-                cached_positions=cached_positions,
-            )
-
-            self._remove_put_task(key)
-
-            if on_complete_callback is not None:
-                try:
-                    on_complete_callback(key)
-                except Exception as e:
+        with self._drain_lock:
+            # -- Drain completions --
+            completed_hashes = self.engine.drain_completed()
+            for io_hash in completed_hashes:
+                entry = self._inflight.pop(io_hash, None)
+                if entry is None:
                     logger.warning(
-                        "on_complete_callback failed for key %s: %s", key, e
+                        "KVStream: drained completed hash %s with no "
+                        "inflight entry",
+                        io_hash,
                     )
+                    continue
 
-        # -- Drain failures --
-        failed_hashes = self.engine.drain_failed()
-        for io_hash in failed_hashes:
-            entry = self._inflight.pop(io_hash, None)
-            if entry is None:
-                logger.warning(
-                    "KVStream: drained failed hash %s with no "
-                    "inflight entry",
+                (
+                    key,
+                    memory_obj,
+                    size,
+                    shape,
+                    dtype,
+                    fmt,
+                    cached_positions,
+                    on_complete_callback,
+                ) = entry
+
+                self.usage += size
+                self.stats_monitor.update_local_storage_usage(self.usage)
+
+                # ref_count_down before insert_key (matches LocalDiskBackend
+                # ordering for mem-leak test compatibility)
+                memory_obj.ref_count_down()
+
+                self.insert_key(
+                    key,
+                    size,
+                    shape,
+                    dtype,
+                    fmt,
+                    cached_positions=cached_positions,
+                )
+
+                self._remove_put_task(key)
+
+                if on_complete_callback is not None:
+                    try:
+                        on_complete_callback(key)
+                    except Exception as e:
+                        logger.warning(
+                            "on_complete_callback failed for key %s: %s",
+                            key,
+                            e,
+                        )
+
+            # -- Drain failures --
+            failed_hashes = self.engine.drain_failed()
+            for io_hash in failed_hashes:
+                entry = self._inflight.pop(io_hash, None)
+                if entry is None:
+                    logger.warning(
+                        "KVStream: drained failed hash %s with no "
+                        "inflight entry",
+                        io_hash,
+                    )
+                    continue
+
+                (
+                    key,
+                    memory_obj,
+                    size,
+                    _shape,
+                    _dtype,
+                    _fmt,
+                    _cached_positions,
+                    _on_complete_callback,
+                ) = entry
+
+                logger.error(
+                    "KVStream: write failed for key %s (io_hash=%s)",
+                    key,
                     io_hash,
                 )
-                continue
 
-            (
-                key,
-                memory_obj,
-                size,
-                _shape,
-                _dtype,
-                _fmt,
-                _cached_positions,
-                _on_complete_callback,
-            ) = entry
+                memory_obj.ref_count_down()
+                self._remove_put_task(key)
 
-            logger.error(
-                "KVStream: write failed for key %s (io_hash=%s)",
-                key,
-                io_hash,
-            )
-
-            memory_obj.ref_count_down()
-            self._remove_put_task(key)
-
-            # Roll back the pre-reserved capacity
-            with self.disk_lock:
-                self.current_cache_size -= size
+                # Roll back the pre-reserved capacity
+                with self.disk_lock:
+                    self.current_cache_size -= size
 
     # ------------------------------------------------------------------ #
     #  Put (write) path — drain-based, no background threads               #
@@ -860,14 +925,23 @@ class KVStreamDiskBackend(StorageBackendInterface):
     def close(self) -> None:
         """Shut down the KVStream engine and flush pending messages.
 
-        1. Calls ``engine.shutdown()`` which internally waits for all
+        1. Stops the background drain thread.
+        2. Calls ``engine.shutdown()`` which internally waits for all
            pending ops on both read and write engines, then tears down
            the io_uring rings and closes the FD cache.
-        2. Calls ``_drain_completed()`` one final time to do remaining
+        3. Calls ``_drain_completed()`` one final time to do remaining
            ``ref_count_down`` / ``insert_key`` bookkeeping for any writes
            that completed during shutdown.
-        3. Closes the batched message sender.
+        4. Closes the batched message sender.
         """
+        # Stop background drain thread
+        self._drain_stop.set()
+        self._drain_thread.join(timeout=2.0)
+        if self._drain_thread.is_alive():
+            logger.warning(
+                "KVStream drain thread did not stop within 2s"
+            )
+
         self.engine.shutdown()
         self._drain_completed()
 
