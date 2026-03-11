@@ -535,6 +535,101 @@ class StorageManager:
             task = asyncio.run_coroutine_threadsafe(coro, self.loop)
             yield task
 
+    def layerwise_batched_get_multi_location(
+        self,
+        keys: List[List[CacheEngineKey]],
+        chunk_locations: List[str],
+    ) -> Generator[Future, None, None]:
+        """Layerwise retrieval when chunks reside in different backends.
+
+        Unlike :meth:`layerwise_batched_get` which targets a single backend,
+        this method partitions each layer's chunk keys by the backend that
+        holds the corresponding chunk and fetches from each backend
+        independently, then merges the results back into the original chunk
+        order.
+
+        After fetching from a non-CPU backend the resulting
+        :class:`MemoryObj` instances are written back into the
+        ``LocalCPUBackend`` hot-cache so that future lookups find them on
+        the faster tier.
+
+        :param List[List[CacheEngineKey]] keys: Layer-major key matrix.
+            ``keys[layer_idx][chunk_idx]`` is the key for that
+            (layer, chunk) pair.
+        :param List[str] chunk_locations: Per-chunk backend name returned by
+            ``StorageManager.contains()`` for layer 0 of each chunk.  Length
+            must equal ``len(keys[0])``.
+
+        :return: A generator that yields a :class:`Future` for each layer.
+            Each future resolves to ``List[MemoryObj]`` in original chunk
+            order.
+        """
+        for keys_multi_chunk in keys:
+            coro = self._fetch_layer_multi_location(
+                keys_multi_chunk, chunk_locations
+            )
+            task = asyncio.run_coroutine_threadsafe(coro, self.loop)
+            yield task
+
+    async def _fetch_layer_multi_location(
+        self,
+        keys_for_layer: List[CacheEngineKey],
+        chunk_locations: List[str],
+    ) -> List[MemoryObj]:
+        """Fetch one layer's chunks from multiple backends and merge.
+
+        :param List[CacheEngineKey] keys_for_layer: One key per chunk for a
+            single layer.
+        :param List[str] chunk_locations: Per-chunk backend name (same
+            length as *keys_for_layer*).
+
+        :return: ``List[MemoryObj]`` in original chunk order.
+        """
+        # ---- partition chunks by backend location ----
+        location_groups: Dict[str, List[Tuple[int, CacheEngineKey]]] = {}
+        for idx, (key, loc) in enumerate(
+            zip(keys_for_layer, chunk_locations)
+        ):
+            location_groups.setdefault(loc, []).append((idx, key))
+
+        # ---- kick off fetches concurrently via asyncio.gather ----
+        results: List[Optional[MemoryObj]] = [None] * len(keys_for_layer)
+
+        coros = []
+        indices_per_coro: List[List[int]] = []
+        for loc, idx_key_pairs in location_groups.items():
+            backend = self.storage_backends[loc]
+            group_keys = [k for _, k in idx_key_pairs]
+            group_indices = [i for i, _ in idx_key_pairs]
+            coros.append(
+                backend.batched_get_non_blocking(
+                    "layerwise_multi_loc", group_keys
+                )
+            )
+            indices_per_coro.append(group_indices)
+
+        all_mem_objs = await asyncio.gather(*coros)
+
+        for mem_objs, group_indices in zip(all_mem_objs, indices_per_coro):
+            for idx, mem_obj in zip(group_indices, mem_objs):
+                results[idx] = mem_obj
+
+        # ---- write-back non-CPU results to the CPU hot-cache ----
+        if "LocalCPUBackend" in self.storage_backends:
+            cpu_backend = self.storage_backends["LocalCPUBackend"]
+            assert isinstance(cpu_backend, LocalCPUBackend)
+            for loc, idx_key_pairs in location_groups.items():
+                if loc == "LocalCPUBackend":
+                    continue
+                wb_keys = [k for _, k in idx_key_pairs]
+                wb_objs = [results[i] for i, _ in idx_key_pairs]
+                if None not in wb_objs:
+                    cpu_backend.batched_submit_put_task(
+                        wb_keys, cast(List[MemoryObj], wb_objs)
+                    )
+
+        return cast(List[MemoryObj], results)
+
     def prefetch_single_done_callback(
         self,
         future: asyncio.Future,

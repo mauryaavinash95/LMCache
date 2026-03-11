@@ -157,6 +157,7 @@ class LMCacheEngine:
         self.event_manager = EventManager()
 
         self.use_layerwise = config.use_layerwise
+        self.layerwise_multi_location = config.kvstream_layerwise_multi_location
 
         # TODO: support save_only_first_rank when use layerwise
         # if use_layerwise is True, all ranks will initialize the storage_manager
@@ -983,6 +984,7 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         location = None
+        chunk_locations: List[str] = []
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens,
             mask=mask,
@@ -996,13 +998,15 @@ class LMCacheEngine:
             if current_location := self.storage_manager.contains(keys_multi_layer[0]):
                 if location is None:
                     location = current_location
-                else:
-                    # TODO(Jiayi): Support multi-location retrieval in the future
-                    assert location == current_location, (
-                        "All retrieved keys should be from the same location "
-                        "when use layerwise retrieval."
-                        "Please support multi-location retrieval in the future."
-                    )
+                elif location != current_location:
+                    if not self.layerwise_multi_location:
+                        assert location == current_location, (
+                            "All retrieved keys should be from the same "
+                            "location when use layerwise retrieval. "
+                            "Enable kvstream_layerwise_multi_location "
+                            "to allow multi-location retrieval."
+                        )
+                chunk_locations.append(current_location)
             else:
                 break
 
@@ -1016,10 +1020,20 @@ class LMCacheEngine:
             # Transpose the keys into layer major format
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
 
-            get_generator = self.storage_manager.layerwise_batched_get(
-                keys_layer_major,
-                location=location,
-            )
+            # Fast path: all chunks in the same backend (common case)
+            unique_locations = set(chunk_locations)
+            if len(unique_locations) == 1:
+                get_generator = self.storage_manager.layerwise_batched_get(
+                    keys_layer_major,
+                    location=chunk_locations[0],
+                )
+            else:
+                get_generator = (
+                    self.storage_manager.layerwise_batched_get_multi_location(
+                        keys_layer_major,
+                        chunk_locations,
+                    )
+                )
 
             assert_layerwise_gpu_connector(self.gpu_connector)
 
@@ -1142,15 +1156,22 @@ class LMCacheEngine:
                         search_range,
                         pin,
                     )
-                    # Only all layers are hit and hit in one location,
-                    # we consider this key as a hit
-                    if hit_chunks == self.num_layers and len(block_mapping) == 1:
+                    # All layers must be present.  When multi-location is
+                    # enabled, layers may span backends (e.g. CPU + disk);
+                    # otherwise we additionally require a single location.
+                    all_layers_hit = hit_chunks == self.num_layers
+                    single_location = len(block_mapping) == 1
+                    if all_layers_hit and (
+                        self.layerwise_multi_location or single_location
+                    ):
                         if pin:
                             assert lookup_id is not None, (
                                 "lookup_id is required when pin is True"
                             )
-                            location = next(iter(block_mapping.keys()))
-                            self.lookup_pins[lookup_id][location].extend(key_all_layers)
+                            for loc, pinned_keys in block_mapping.items():
+                                self.lookup_pins[lookup_id][loc].extend(
+                                    pinned_keys
+                                )
                         res = end
                         continue
                     return res
@@ -1763,6 +1784,18 @@ class LMCacheEngine:
         # ---- Step 2: process each location ----
         last_failed_block_start = None
 
+        # Profiling accumulators
+        t_retrieve_start = time.perf_counter()
+        cpu_chunks = 0
+        cpu_bytes = 0
+        t_cpu_total = 0.0
+        disk_chunks = 0
+        disk_bytes = 0
+        t_disk_submit = 0.0
+        t_disk_first_completion = 0.0
+        t_disk_last_completion = 0.0
+        t_gpu_sync = 0.0
+
         for location, blocks in block_mapping.items():
             keys = [key for key, _, _ in blocks]
 
@@ -1772,9 +1805,12 @@ class LMCacheEngine:
             ):
                 # --- OVERLAPPED PATH: KVStream ---
                 # Submit all io_uring reads at once (non-blocking).
+                t0 = time.perf_counter()
                 pending = kvstream_backend.submit_batch_load(keys)
+                t_disk_submit = time.perf_counter() - t0
 
                 # Interleave completions with GPU transfers.
+                first_completion_recorded = False
                 with torch.cuda.stream(self.gpu_connector.load_stream):
                     for (key, start, end), entry in zip(
                         blocks, pending, strict=False
@@ -1796,6 +1832,12 @@ class LMCacheEngine:
                             io_hash, key, memory_obj
                         )
 
+                        t_now = time.perf_counter()
+                        if not first_completion_recorded:
+                            t_disk_first_completion = t_now - t0
+                            first_completion_recorded = True
+                        t_disk_last_completion = t_now - t0
+
                         # Queue GPU transfer immediately on load_stream.
                         self.gpu_connector.to_gpu(
                             memory_obj, start, end, **kwargs
@@ -1804,13 +1846,19 @@ class LMCacheEngine:
                         reordered_chunks.append(
                             (key, memory_obj, start, end)
                         )
-                        tot_kv_size += memory_obj.get_size()
+                        chunk_size = memory_obj.get_size()
+                        tot_kv_size += chunk_size
+                        disk_bytes += chunk_size
+                        disk_chunks += 1
                         ret_mask[start:end] = True
 
+                t_sync_start = time.perf_counter()
                 self.gpu_connector.load_stream.synchronize()
+                t_gpu_sync = time.perf_counter() - t_sync_start
 
             else:
                 # --- STANDARD PATH: CPU or other backends ---
+                t0_cpu = time.perf_counter()
                 memory_objs = self.storage_manager.batched_get(
                     keys=keys,
                     location=location,
@@ -1840,10 +1888,14 @@ class LMCacheEngine:
                         reordered_chunks.append(
                             (key, memory_obj, start, end)
                         )
-                        tot_kv_size += memory_obj.get_size()
+                        chunk_size = memory_obj.get_size()
+                        tot_kv_size += chunk_size
+                        cpu_bytes += chunk_size
+                        cpu_chunks += 1
                         ret_mask[start:end] = True
 
                 self.gpu_connector.load_stream.synchronize()
+                t_cpu_total = time.perf_counter() - t0_cpu
 
         # ---- Step 3: handle failures ----
         if last_failed_block_start is not None:
@@ -1853,6 +1905,44 @@ class LMCacheEngine:
                 for key, memory_obj, start, end in reordered_chunks
                 if end < last_failed_block_start
             ]
+
+        # ---- Profiling summary ----
+        t_retrieve_total = time.perf_counter() - t_retrieve_start
+        rank = self.metadata.worker_id
+        total_chunks = cpu_chunks + disk_chunks
+        total_bytes_mb = (cpu_bytes + disk_bytes) / 1e6
+
+        if total_chunks > 0:
+            parts = [
+                f"rank={rank}",
+                f"chunks={total_chunks}",
+                f"total={t_retrieve_total * 1e3:.1f}ms",
+                f"data={total_bytes_mb:.1f}MB",
+            ]
+            if cpu_chunks > 0:
+                parts.append(
+                    f"cpu={cpu_chunks}chunks/"
+                    f"{cpu_bytes / 1e6:.1f}MB/"
+                    f"{t_cpu_total * 1e3:.1f}ms"
+                )
+            if disk_chunks > 0:
+                disk_bw = (
+                    disk_bytes / t_disk_last_completion / 1e6
+                    if t_disk_last_completion > 0
+                    else 0.0
+                )
+                parts.append(
+                    f"disk={disk_chunks}chunks/"
+                    f"{disk_bytes / 1e6:.1f}MB/"
+                    f"submit={t_disk_submit * 1e3:.2f}ms/"
+                    f"first={t_disk_first_completion * 1e3:.1f}ms/"
+                    f"last={t_disk_last_completion * 1e3:.1f}ms/"
+                    f"bw={disk_bw:.0f}MB/s/"
+                    f"gpu_sync={t_gpu_sync * 1e3:.2f}ms"
+                )
+            logger.info(
+                "overlapped_retrieve: %s", " | ".join(parts)
+            )
 
         return reordered_chunks, tot_kv_size
 
