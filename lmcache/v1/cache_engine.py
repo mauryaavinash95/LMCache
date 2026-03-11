@@ -802,22 +802,55 @@ class LMCacheEngine:
         ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
 
         reordered_chunks: List[ProcessedChunk] = []
-        if not self._is_passive():
+
+        # Check if the KVStream overlapped disk↔GPU path is available.
+        # Conditions: KVStream backend registered, not async_loading,
+        # not passive, and gpu_connector has a load_stream.
+        kvstream_backend = (
+            self.storage_manager.get_backend("KVStreamDiskBackend")
+            if self.storage_manager is not None
+            else None
+        )
+        use_overlapped = (
+            kvstream_backend is not None
+            and not self._is_passive()
+            and not self.async_loading
+            and hasattr(self.gpu_connector, "load_stream")
+        )
+
+        if use_overlapped:
+            # Overlapped path: disk reads and GPU copies are interleaved
+            # inside _retrieve_overlapped_kvstream, so we skip the
+            # separate batched_to_gpu call below.
             with retrieve_stats.profile_process_tokens():
-                if self.async_loading:
-                    reordered_chunks, tot_kv_size = self._async_process_tokens_internal(  # noqa: E501
+                reordered_chunks, tot_kv_size = (
+                    self._retrieve_overlapped_kvstream(
                         tokens,
                         mask,
                         ret_mask,
+                        kvstream_backend,
                         **kwargs,
                     )
-                else:
-                    reordered_chunks, tot_kv_size = self._process_tokens_internal(
-                        tokens,
-                        mask,
-                        ret_mask,
-                        **kwargs,
-                    )
+                )
+            gpu_copies_done = True
+        else:
+            gpu_copies_done = False
+            if not self._is_passive():
+                with retrieve_stats.profile_process_tokens():
+                    if self.async_loading:
+                        reordered_chunks, tot_kv_size = self._async_process_tokens_internal(  # noqa: E501
+                            tokens,
+                            mask,
+                            ret_mask,
+                            **kwargs,
+                        )
+                    else:
+                        reordered_chunks, tot_kv_size = self._process_tokens_internal(
+                            tokens,
+                            mask,
+                            ret_mask,
+                            **kwargs,
+                        )
 
         if self.save_only_first_rank:
             with retrieve_stats.profile_broadcast():
@@ -840,7 +873,7 @@ class LMCacheEngine:
         # cpu tensor for the sake of performance.
         # For example, disk->gpu is faster than disk->cpu->gpu.
         # RDMA is another example.
-        if len(reordered_chunks) > 0:
+        if len(reordered_chunks) > 0 and not gpu_copies_done:
             with retrieve_stats.profile_to_gpu():
                 _, memory_objs, starts, ends = zip(*reordered_chunks, strict=False)
                 self.gpu_connector.batched_to_gpu(
@@ -1657,6 +1690,170 @@ class LMCacheEngine:
                 for key, memory_obj, start, end in reordered_chunks
                 if end < last_failed_block_start
             ]
+        return reordered_chunks, tot_kv_size
+
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
+    def _retrieve_overlapped_kvstream(
+        self,
+        tokens,
+        mask,
+        ret_mask,
+        kvstream_backend,
+        **kwargs,
+    ) -> ProcessTokensInternalResult:
+        """Overlapped disk-read + GPU-transfer retrieval for KVStream.
+
+        Merges the ``_process_tokens_internal`` and ``batched_to_gpu``
+        phases into a single interleaved pipeline.  For chunks stored in
+        the KVStream disk backend, all io_uring read SQEs are submitted
+        in one batch.  As each read completes, the GPU transfer for that
+        chunk is immediately queued on the CUDA ``load_stream``, allowing
+        disk I/O to overlap with H2D copies.
+
+        Chunks stored in other backends (e.g. ``LocalCPUBackend``) are
+        handled via the standard ``batched_get`` + per-chunk ``to_gpu``
+        path.
+
+        Args:
+            tokens: Input tokens to process.
+            mask: Mask indicating valid token positions.
+            ret_mask: Output mask updated with cache hit positions.
+            kvstream_backend: The ``KVStreamDiskBackend`` instance.
+            **kwargs: Additional keyword arguments (must include
+                ``kvcaches``, ``slot_mapping``, etc.).
+
+        Returns:
+            Tuple of (reordered_chunks, total_kv_size).
+        """
+        # Lazy import to avoid circular dependency at module level
+        from lmcache.v1.storage_backend.kvstream_disk_backend import (
+            KVStreamDiskBackend,
+        )
+
+        assert self.storage_manager is not None
+        assert self.gpu_connector is not None
+
+        tot_kv_size = 0
+        reordered_chunks: List[ProcessedChunk] = []
+        request_configs = kwargs.get("request_configs")
+        if request_configs is not None and len(request_configs) != 0:
+            assert isinstance(request_configs, dict)
+
+        # ---- Step 1: compute chunk_infos and block_mapping ----
+        chunk_infos = []
+        for start, end, key in self.token_database.process_tokens(
+            tokens=tokens,
+            mask=mask,
+            request_configs=request_configs,
+        ):
+            assert isinstance(key, CacheEngineKey)
+            chunk_infos.append((key, start, end))
+
+        if (
+            "req_id" in kwargs
+            and kwargs["req_id"] in self.lookup_pins
+            and len(self.lookup_pins[kwargs["req_id"]]) == 1
+        ):
+            location = next(iter(self.lookup_pins[kwargs["req_id"]].keys()))
+            block_mapping = {location: chunk_infos}
+        else:
+            block_mapping = self.storage_manager.get_block_mapping(chunk_infos)
+
+        # ---- Step 2: process each location ----
+        last_failed_block_start = None
+
+        for location, blocks in block_mapping.items():
+            keys = [key for key, _, _ in blocks]
+
+            if (
+                location == "KVStreamDiskBackend"
+                and isinstance(kvstream_backend, KVStreamDiskBackend)
+            ):
+                # --- OVERLAPPED PATH: KVStream ---
+                # Submit all io_uring reads at once (non-blocking).
+                pending = kvstream_backend.submit_batch_load(keys)
+
+                # Interleave completions with GPU transfers.
+                with torch.cuda.stream(self.gpu_connector.load_stream):
+                    for (key, start, end), entry in zip(
+                        blocks, pending, strict=False
+                    ):
+                        if entry is None:
+                            logger.warning(
+                                "KVStream overlapped: key missing "
+                                "from disk cache during load"
+                            )
+                            if (
+                                last_failed_block_start is None
+                                or last_failed_block_start < start
+                            ):
+                                last_failed_block_start = start
+                            break
+
+                        io_hash, _, memory_obj = entry
+                        kvstream_backend.wait_one_load(
+                            io_hash, key, memory_obj
+                        )
+
+                        # Queue GPU transfer immediately on load_stream.
+                        self.gpu_connector.to_gpu(
+                            memory_obj, start, end, **kwargs
+                        )
+
+                        reordered_chunks.append(
+                            (key, memory_obj, start, end)
+                        )
+                        tot_kv_size += memory_obj.get_size()
+                        ret_mask[start:end] = True
+
+                self.gpu_connector.load_stream.synchronize()
+
+            else:
+                # --- STANDARD PATH: CPU or other backends ---
+                memory_objs = self.storage_manager.batched_get(
+                    keys=keys,
+                    location=location,
+                )
+
+                # GPU-copy the non-KVStream chunks.
+                with torch.cuda.stream(self.gpu_connector.load_stream):
+                    for (key, start, end), memory_obj in zip(
+                        blocks, memory_objs, strict=False
+                    ):
+                        if memory_obj is None:
+                            logger.warning(
+                                "The cache block is in the storage, "
+                                "but it can't be retrieved"
+                            )
+                            if (
+                                last_failed_block_start is None
+                                or last_failed_block_start < start
+                            ):
+                                last_failed_block_start = start
+                            break
+
+                        self.gpu_connector.to_gpu(
+                            memory_obj, start, end, **kwargs
+                        )
+
+                        reordered_chunks.append(
+                            (key, memory_obj, start, end)
+                        )
+                        tot_kv_size += memory_obj.get_size()
+                        ret_mask[start:end] = True
+
+                self.gpu_connector.load_stream.synchronize()
+
+        # ---- Step 3: handle failures ----
+        if last_failed_block_start is not None:
+            ret_mask[last_failed_block_start:] = False
+            reordered_chunks = [
+                (key, memory_obj, start, end)
+                for key, memory_obj, start, end in reordered_chunks
+                if end < last_failed_block_start
+            ]
+
         return reordered_chunks, tot_kv_size
 
     def _broadcast_or_receive_memory_objs(

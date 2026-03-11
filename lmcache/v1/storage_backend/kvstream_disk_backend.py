@@ -801,6 +801,164 @@ class KVStreamDiskBackend(StorageBackendInterface):
 
         return memory_obj
 
+    def batched_get_blocking(
+        self,
+        keys: List[CacheEngineKey],
+    ) -> List[Optional[MemoryObj]]:
+        """Batched blocking read using io_uring batch submission.
+
+        Overrides the default sequential ``get_blocking`` loop from
+        ``StorageBackendInterface``.  All reads are submitted to io_uring
+        in a single ``load_batch`` call, allowing the kernel to process
+        them concurrently.  Then ``wait_all`` blocks until every read
+        completes.
+
+        Args:
+            keys: Ordered list of cache keys to load.
+
+        Returns:
+            List of ``MemoryObj`` (or ``None`` for missing keys), in the
+            same order as *keys*.
+        """
+        mem_objs: List[Optional[MemoryObj]] = []
+        load_entries: list[tuple[str, "torch.Tensor", str, int]] = []
+        # Track which indices in mem_objs have valid io_uring loads
+        valid_indices: list[int] = []
+
+        for i, key in enumerate(keys):
+            with self.disk_lock:
+                if key not in self.dict:
+                    mem_objs.append(None)
+                    continue
+                self.cache_policy.update_on_hit(key, self.dict)
+                disk_meta = self.dict[key]
+                path = disk_meta.path
+                dtype = disk_meta.dtype
+                shape = disk_meta.shape
+                fmt = disk_meta.fmt
+
+            assert dtype is not None
+            assert shape is not None
+
+            memory_obj = self.local_cpu_backend.allocate(shape, dtype, fmt)
+            assert memory_obj is not None, (
+                "Memory allocation failed during KVStream batched disk load."
+            )
+
+            io_hash = self._next_io_hash(key, "load")
+            load_entries.append((io_hash, memory_obj.raw_tensor, path, 0))
+            mem_objs.append(memory_obj)
+            valid_indices.append(i)
+
+        if load_entries:
+            start_time = time.time()
+            self.engine.load_batch(load_entries)
+            self.engine.wait_all(self.kvstream_core.IOQueue.READ)
+            elapsed = time.time() - start_time
+
+            total_bytes = sum(
+                mem_objs[i].get_physical_size()  # type: ignore[union-attr]
+                for i in valid_indices
+            )
+            if elapsed > 0:
+                logger.debug(
+                    "KVStream batched_get_blocking: %d entries, %d bytes, "
+                    "%.2f MB/s",
+                    len(load_entries),
+                    total_bytes,
+                    total_bytes / elapsed / 1e6,
+                )
+
+            # Recover cached_positions metadata
+            for i in valid_indices:
+                key = keys[i]
+                disk_meta = self.dict.get(key, None)
+                if disk_meta is not None:
+                    mem_objs[i].metadata.cached_positions = (  # type: ignore[union-attr]
+                        disk_meta.cached_positions
+                    )
+
+        return mem_objs
+
+    # ------------------------------------------------------------------ #
+    #  Overlapped read path (Level 2)                                      #
+    # ------------------------------------------------------------------ #
+
+    def submit_batch_load(
+        self,
+        keys: List[CacheEngineKey],
+    ) -> List[Optional[tuple[str, CacheEngineKey, MemoryObj]]]:
+        """Submit all reads via ``load_batch`` without waiting.
+
+        Pre-allocates ``MemoryObj`` instances for every valid key and
+        submits all io_uring read SQEs in one batch.  Returns immediately
+        so the caller can interleave ``wait_one_load`` completions with
+        GPU transfers.
+
+        Args:
+            keys: Ordered list of cache keys to load.
+
+        Returns:
+            A list with one entry per key.  Each entry is either
+            ``(io_hash, key, memory_obj)`` for a valid key, or ``None``
+            if the key was not found in the disk cache.
+        """
+        results: List[Optional[tuple[str, CacheEngineKey, MemoryObj]]] = []
+        load_entries: list[tuple[str, "torch.Tensor", str, int]] = []
+
+        for key in keys:
+            with self.disk_lock:
+                if key not in self.dict:
+                    results.append(None)
+                    continue
+                self.cache_policy.update_on_hit(key, self.dict)
+                disk_meta = self.dict[key]
+                path = disk_meta.path
+                dtype = disk_meta.dtype
+                shape = disk_meta.shape
+                fmt = disk_meta.fmt
+
+            assert dtype is not None
+            assert shape is not None
+
+            memory_obj = self.local_cpu_backend.allocate(shape, dtype, fmt)
+            assert memory_obj is not None, (
+                "Memory allocation failed during KVStream overlapped load."
+            )
+
+            io_hash = self._next_io_hash(key, "load")
+            load_entries.append((io_hash, memory_obj.raw_tensor, path, 0))
+            results.append((io_hash, key, memory_obj))
+
+        if load_entries:
+            self.engine.load_batch(load_entries)
+
+        return results
+
+    def wait_one_load(
+        self,
+        io_hash: str,
+        key: CacheEngineKey,
+        memory_obj: MemoryObj,
+    ) -> None:
+        """Block until a single read operation completes.
+
+        Called in a loop by the overlapped retrieval path in
+        ``CacheEngine._retrieve_overlapped_kvstream`` to wait for
+        one chunk at a time, allowing GPU transfers to be interleaved.
+
+        Args:
+            io_hash: The KVStream operation hash from ``submit_batch_load``.
+            key: The cache engine key (used to recover metadata).
+            memory_obj: The pre-allocated ``MemoryObj`` receiving the data.
+        """
+        self.engine.wait_one(io_hash, self.kvstream_core.IOQueue.READ)
+
+        # Recover cached_positions metadata
+        disk_meta = self.dict.get(key, None)
+        if disk_meta is not None:
+            memory_obj.metadata.cached_positions = disk_meta.cached_positions
+
     def _sync_batch_load(
         self,
         io_hashes: list[str],

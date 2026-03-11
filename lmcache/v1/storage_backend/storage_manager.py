@@ -876,6 +876,19 @@ class StorageManager:
         """
         return list(self.storage_backends.keys())
 
+    def get_backend(
+        self, name: str
+    ) -> Optional["StorageBackendInterface"]:
+        """Get a storage backend instance by name.
+
+        Args:
+            name: The backend class name (e.g. ``"KVStreamDiskBackend"``).
+
+        Returns:
+            The backend instance, or ``None`` if not registered.
+        """
+        return self.storage_backends.get(name)
+
     def contains(
         self,
         key: CacheEngineKey,
