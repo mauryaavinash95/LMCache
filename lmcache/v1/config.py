@@ -85,6 +85,11 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    "kvstream_per_layer_mem_handling": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
     "remote_url": {
         "type": Optional[str],
         "default": None,
