@@ -1121,7 +1121,7 @@ class LMCacheConnectorV1Impl:
             return
 
         if self.use_layerwise:
-            for layerwise_storer in self.layerwise_storers:
+            for layerwise_storer in self._layerwise_save_storers.values():
                 # next(layerwise_storer)
                 try:
                     next(layerwise_storer)
@@ -1136,7 +1136,10 @@ class LMCacheConnectorV1Impl:
                     request.req_id, None
                 )
                 if layerwise_storer is not None:
-                    next(layerwise_storer)
+                    try:
+                        next(layerwise_storer)
+                    except StopIteration:
+                        pass
                 # unpin the kv caches according to req_id
                 self.lmcache_engine.lookup_unpin(request.req_id)
             return
