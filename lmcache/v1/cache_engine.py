@@ -157,7 +157,6 @@ class LMCacheEngine:
         self.event_manager = EventManager()
 
         self.use_layerwise = config.use_layerwise
-        self.layerwise_multi_location = config.kvstream_layerwise_multi_location
         self.per_layer_mem_handling = config.kvstream_per_layer_mem_handling
 
         # TODO: support save_only_first_rank when use layerwise
@@ -1000,11 +999,11 @@ class LMCacheEngine:
                 if location is None:
                     location = current_location
                 elif location != current_location:
-                    if not self.layerwise_multi_location:
+                    if not self.per_layer_mem_handling:
                         assert location == current_location, (
                             "All retrieved keys should be from the same "
                             "location when use layerwise retrieval. "
-                            "Enable kvstream_layerwise_multi_location "
+                            "Enable kvstream_per_layer_mem_handling "
                             "to allow multi-location retrieval."
                         )
                 chunk_locations.append(current_location)
@@ -1194,7 +1193,7 @@ class LMCacheEngine:
                     all_layers_hit = hit_chunks == self.num_layers
                     single_location = len(block_mapping) == 1
                     if all_layers_hit and (
-                        self.layerwise_multi_location or single_location
+                        self.per_layer_mem_handling or single_location
                     ):
                         if pin:
                             assert lookup_id is not None, (
