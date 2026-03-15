@@ -80,7 +80,7 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
-    "kvstream_per_layer_mem_handling": {
+    "kvstream_layerwise_multi_location": {
         "type": bool,
         "default": False,
         "env_converter": _to_bool,

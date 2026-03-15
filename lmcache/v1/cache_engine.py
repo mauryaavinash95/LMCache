@@ -157,7 +157,7 @@ class LMCacheEngine:
         self.event_manager = EventManager()
 
         self.use_layerwise = config.use_layerwise
-        self.per_layer_mem_handling = config.kvstream_per_layer_mem_handling
+        self.layerwise_multi_location = config.kvstream_layerwise_multi_location
 
         # TODO: support save_only_first_rank when use layerwise
         # if use_layerwise is True, all ranks will initialize the storage_manager
@@ -999,11 +999,11 @@ class LMCacheEngine:
                 if location is None:
                     location = current_location
                 elif location != current_location:
-                    if not self.per_layer_mem_handling:
+                    if not self.layerwise_multi_location:
                         assert location == current_location, (
                             "All retrieved keys should be from the same "
                             "location when use layerwise retrieval. "
-                            "Enable kvstream_per_layer_mem_handling "
+                            "Enable kvstream_layerwise_multi_location "
                             "to allow multi-location retrieval."
                         )
                 chunk_locations.append(current_location)
@@ -1040,7 +1040,7 @@ class LMCacheEngine:
             mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
             next(mem_obj_consumer)
 
-            to_count_down: list = []
+            to_count_down = []
             for layer_id in range(self.num_layers):
                 task = next(get_generator)
 
@@ -1055,41 +1055,10 @@ class LMCacheEngine:
 
                 mem_objs_layer = task.result()
                 mem_obj_consumer.send(mem_objs_layer)
+                to_count_down.extend(mem_objs_layer)
 
-                if self.per_layer_mem_handling:
-                    # After send() returns, torch.cuda.synchronize()
-                    # has completed inside batched_to_gpu — the CPU
-                    # memory for this layer is no longer needed.
-                    #
-                    # Release per-layer to keep peak CPU memory at
-                    # ~N_chunks instead of N_chunks * num_layers.
-                    for i, mem_obj in enumerate(mem_objs_layer):
-                        if chunk_locations[i] != "LocalCPUBackend":
-                            # Disk-loaded temporary MemoryObj: unpin
-                            # the standalone pin (P7/P12) set in
-                            # batched_get_non_blocking, then release
-                            # the ref (1→0) which triggers free().
-                            mem_obj.unpin()
-                        mem_obj.ref_count_down()
-
-                    # Unpin CPU hot_cache entries by key (covers
-                    # lookup pins P1/P2) so they become evictable.
-                    cpu_layer_keys = [
-                        keys_layer_major[layer_id][i]
-                        for i in range(len(chunk_locations))
-                        if chunk_locations[i] == "LocalCPUBackend"
-                    ]
-                    if cpu_layer_keys:
-                        assert self.storage_manager is not None
-                        self.storage_manager.batched_unpin(
-                            cpu_layer_keys
-                        )
-                else:
-                    to_count_down.extend(mem_objs_layer)
-
-            if not self.per_layer_mem_handling:
-                for mem_obj in to_count_down:
-                    mem_obj.ref_count_down()
+            for mem_obj in to_count_down:
+                mem_obj.ref_count_down()
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
@@ -1193,7 +1162,7 @@ class LMCacheEngine:
                     all_layers_hit = hit_chunks == self.num_layers
                     single_location = len(block_mapping) == 1
                     if all_layers_hit and (
-                        self.per_layer_mem_handling or single_location
+                        self.layerwise_multi_location or single_location
                     ):
                         if pin:
                             assert lookup_id is not None, (
