@@ -429,11 +429,19 @@ class LocalDiskBackend(StorageBackendInterface):
             assert dtype is not None
             assert shape is not None
 
+            _alloc_t0 = time.time()
             memory_obj = self.local_cpu_backend.allocate(
                 shape,
                 dtype,
                 fmt,
             )
+            _alloc_elapsed = time.time() - _alloc_t0
+            if _alloc_elapsed > 0.01:
+                logger.warning(
+                    "D2H allocate for disk read took %.3fs (key=%s)",
+                    _alloc_elapsed,
+                    key,
+                )
 
             assert memory_obj is not None, (
                 "Memory allocation failed during async disk load."

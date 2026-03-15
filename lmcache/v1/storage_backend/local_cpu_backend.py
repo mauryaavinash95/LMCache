@@ -566,6 +566,29 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
                 # TODO: make time_to_wait a config
                 time_to_wait = 0.1
+                # Log a detailed breakdown on the first retry to help
+                # diagnose WHY no eviction candidates exist.
+                if num_attempts == 0:
+                    with self.cpu_lock:
+                        _n_total = len(self.hot_cache)
+                        _n_pinned = 0
+                        _n_ref_gt1 = 0
+                        _n_evictable = 0
+                        for _v in self.hot_cache.values():
+                            if _v.is_pinned:
+                                _n_pinned += 1
+                            if _v.ref_count > 1:
+                                _n_ref_gt1 += 1
+                            if _v.can_evict:
+                                _n_evictable += 1
+                    logger.warning(
+                        "CPU memory pressure breakdown: "
+                        "total=%d pinned=%d ref_count>1=%d evictable=%d",
+                        _n_total,
+                        _n_pinned,
+                        _n_ref_gt1,
+                        _n_evictable,
+                    )
                 logger.warning(
                     "No eviction candidates found in local cpu backend. "
                     "Local cpu memory is under pressure. "
