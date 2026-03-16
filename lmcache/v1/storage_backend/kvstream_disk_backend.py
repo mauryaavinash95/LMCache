@@ -150,11 +150,23 @@ class KVStreamDiskBackend(StorageBackendInterface):
 
         # -- KVStream engine ---------------------------------------------
         extra = config.extra_config or {}
-        chunk_size_kb: int = int(extra.get("kvstream_chunk_size_kb", 4096))
-        queue_depth: int = int(extra.get("kvstream_queue_depth", 32768))
+        chunk_size_kb: int = int(
+            extra.get("kvstream_chunk_size_kb", 4096)
+        )
+        read_queue_depth: int = int(
+            extra.get("kvstream_read_queue_depth", 64)
+        )
+        write_queue_depth: int = int(
+            extra.get("kvstream_write_queue_depth", 4)
+        )
+        write_chunk_size_kb: int = int(
+            extra.get("kvstream_write_chunk_size_kb", 256)
+        )
         max_fds: int = int(extra.get("kvstream_max_fds", 4096))
         max_retries: int = int(extra.get("kvstream_max_retries", 10))
-        try_odirect: bool = bool(extra.get("kvstream_try_odirect", True))
+        try_odirect: bool = bool(
+            extra.get("kvstream_try_odirect", True)
+        )
 
         try:
             from kvstream import kvstream_core
@@ -162,17 +174,22 @@ class KVStreamDiskBackend(StorageBackendInterface):
             self.kvstream_core = kvstream_core
             self.engine = kvstream_core.KVStream(
                 chunk_size_kb=chunk_size_kb,
-                queue_depth=queue_depth,
+                read_queue_depth=read_queue_depth,
+                write_queue_depth=write_queue_depth,
+                write_chunk_size_kb=write_chunk_size_kb,
                 max_fds_open=max_fds,
                 try_using_odirect=try_odirect,
                 max_retries=max_retries,
             )
             logger.info(
-                "KVStream engine initialized: chunk_size_kb=%d, "
-                "queue_depth=%d, max_fds=%d, try_odirect=%s, "
-                "max_retries=%d",
+                "KVStream engine initialized: "
+                "chunk_size_kb=%d, read_qd=%d, write_qd=%d, "
+                "write_chunk_size_kb=%d, max_fds=%d, "
+                "try_odirect=%s, max_retries=%d",
                 chunk_size_kb,
-                queue_depth,
+                read_queue_depth,
+                write_queue_depth,
+                write_chunk_size_kb,
                 max_fds,
                 try_odirect,
                 max_retries,
