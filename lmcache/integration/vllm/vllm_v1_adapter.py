@@ -3,6 +3,7 @@
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
+import json
 import os
 
 # Third Party
@@ -565,6 +566,12 @@ class LMCacheConnectorV1Impl:
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
         self._requests_priority: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
+
+        # Per-step instrumentation (gated behind kvstream_step_logging)
+        self._step_counter: int = 0
+        self._step_logging_enabled: bool = bool(
+            config.get_extra_config_value("kvstream_step_logging", False)
+        )
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -1622,6 +1629,7 @@ class LMCacheConnectorV1Impl:
                 )
                 if req_meta is not None:
                     meta.add_request(req_meta)
+            self._emit_step_log(scheduler_output, meta)
             return meta
 
         for i, req_id in enumerate(cached_reqs.req_ids):
@@ -1702,7 +1710,97 @@ class LMCacheConnectorV1Impl:
             if req_meta is not None:
                 meta.add_request(req_meta)
 
+        self._emit_step_log(scheduler_output, meta)
         return meta
+
+    def _emit_step_log(
+        self,
+        scheduler_output: SchedulerOutput,
+        meta: LMCacheConnectorMetadata,
+    ) -> None:
+        """Emit per-step JSON log line with per-request scheduling stats.
+
+        Gated behind the ``kvstream_step_logging`` extra config flag.
+        Each request is classified as PREFILL (new, has load_spec),
+        PREFILL_CONT (continuation chunk, no load_spec, >1 token),
+        or DECODE (1 token scheduled).
+
+        Args:
+            scheduler_output: The scheduler output for this step.
+            meta: The connector metadata built for this step.
+        """
+        if not self._step_logging_enabled:
+            return
+
+        self._step_counter += 1
+
+        prefills = []
+        prefill_conts = []
+        decode_reqs = 0
+        decode_tokens = 0
+        total_tokens = 0
+
+        num_sched = scheduler_output.num_scheduled_tokens
+        new_req_ids = {
+            r.req_id for r in scheduler_output.scheduled_new_reqs
+        }
+
+        for req_id, n_tokens in num_sched.items():
+            total_tokens += n_tokens
+            tracker = self._request_trackers.get(req_id)
+
+            if req_id in new_req_ids:
+                # New prefill request — has load_spec data
+                load_spec = None
+                for rm in meta.requests:
+                    if rm.req_id == req_id:
+                        load_spec = rm.load_spec
+                        break
+                if load_spec is not None:
+                    gpu = load_spec.vllm_cached_tokens
+                    lmc = load_spec.lmcache_cached_tokens - gpu
+                    lmc = max(0, lmc)
+                    fresh = n_tokens - gpu - lmc
+                    fresh = max(0, fresh)
+                else:
+                    gpu = 0
+                    lmc = 0
+                    fresh = n_tokens
+                prefills.append({
+                    "req": req_id[:8],
+                    "tokens": n_tokens,
+                    "gpu": gpu,
+                    "lmc": lmc,
+                    "fresh": fresh,
+                })
+            elif n_tokens > 1:
+                # Continuation prefill chunk
+                prefill_conts.append({
+                    "req": req_id[:8],
+                    "tokens": n_tokens,
+                })
+            else:
+                # Decode
+                decode_reqs += 1
+                decode_tokens += n_tokens
+
+        step_data = {
+            "type": "STEP",
+            "step": self._step_counter,
+            "num_reqs": len(num_sched),
+            "num_prefill": len(prefills),
+            "num_prefill_cont": len(prefill_conts),
+            "num_decode": decode_reqs,
+            "total_tokens": total_tokens,
+            "prefills": prefills,
+        }
+        if prefill_conts:
+            step_data["prefill_conts"] = prefill_conts
+        if decode_reqs > 0:
+            step_data["decode_reqs"] = decode_reqs
+            step_data["decode_tokens"] = decode_tokens
+
+        logger.info(json.dumps(step_data, separators=(",", ":")))
 
     @_lmcache_nvtx_annotate
     def request_finished(
