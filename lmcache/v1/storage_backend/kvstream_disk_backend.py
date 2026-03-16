@@ -150,8 +150,8 @@ class KVStreamDiskBackend(StorageBackendInterface):
 
         # -- KVStream engine ---------------------------------------------
         extra = config.extra_config or {}
-        chunk_size_kb: int = int(
-            extra.get("kvstream_chunk_size_kb", 4096)
+        read_chunk_size_kb: int = int(
+            extra.get("kvstream_read_chunk_size_kb", 4096)
         )
         read_queue_depth: int = int(
             extra.get("kvstream_read_queue_depth", 64)
@@ -173,7 +173,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
 
             self.kvstream_core = kvstream_core
             self.engine = kvstream_core.KVStream(
-                chunk_size_kb=chunk_size_kb,
+                read_chunk_size_kb=read_chunk_size_kb,
                 read_queue_depth=read_queue_depth,
                 write_queue_depth=write_queue_depth,
                 write_chunk_size_kb=write_chunk_size_kb,
@@ -183,10 +183,10 @@ class KVStreamDiskBackend(StorageBackendInterface):
             )
             logger.info(
                 "KVStream engine initialized: "
-                "chunk_size_kb=%d, read_qd=%d, write_qd=%d, "
-                "write_chunk_size_kb=%d, max_fds=%d, "
+                "read_chunk_kb=%d, read_qd=%d, write_qd=%d, "
+                "write_chunk_kb=%d, max_fds=%d, "
                 "try_odirect=%s, max_retries=%d",
-                chunk_size_kb,
+                read_chunk_size_kb,
                 read_queue_depth,
                 write_queue_depth,
                 write_chunk_size_kb,
