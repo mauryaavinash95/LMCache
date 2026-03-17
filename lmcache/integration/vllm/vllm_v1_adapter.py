@@ -573,6 +573,13 @@ class LMCacheConnectorV1Impl:
             config.get_extra_config_value("kvstream_step_logging", False)
         )
 
+        # Deferred-write support: reference to KVStream backend (lazy init).
+        # Set on first start_load_kv call if the backend has deferred writes
+        # enabled.  Used to flush previous step's writes after current
+        # step's reads complete.
+        self._kvstream_backend: Optional["KVStreamDiskBackend"] = None  # noqa: F821
+        self._kvstream_deferred_checked: bool = False
+
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
         if self.lmcache_engine is None:
@@ -776,6 +783,9 @@ class LMCacheConnectorV1Impl:
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
             logger.debug("In connector.start_load_kv, but the attn_metadata is None")
+            # Still flush deferred writes — no reads this step means
+            # writes can proceed with zero contention.
+            self._flush_deferred_writes_if_enabled()
             return
 
         assert self.lmcache_engine is not None
@@ -912,6 +922,33 @@ class LMCacheConnectorV1Impl:
                         slot_mapping[:lmcache_cached_tokens],
                     )
                     self._invalid_block_ids.update(missing_blocks)
+
+        self._flush_deferred_writes_if_enabled()
+
+    def _flush_deferred_writes_if_enabled(self) -> None:
+        """Flush deferred KVStream writes from the previous step.
+
+        On the first call, lazily discovers the KVStream backend from
+        the storage manager.  Subsequent calls go straight to flush.
+
+        Accesses ``_deferred_writes_enabled`` directly on the
+        ``KVStreamDiskBackend`` instance to avoid adding a public API
+        for this KVStream-only optimisation.
+        """
+        if not self._kvstream_deferred_checked:
+            self._kvstream_deferred_checked = True
+            if self.lmcache_engine is not None:
+                sm = self.lmcache_engine.storage_manager
+                if sm is not None:
+                    be = sm.get_backend("KVStreamDiskBackend")
+                    if (
+                        be is not None
+                        and getattr(be, "_deferred_writes_enabled", False)
+                    ):
+                        self._kvstream_backend = be
+
+        if self._kvstream_backend is not None:
+            self._kvstream_backend.flush_deferred_writes()
 
     def record_failed_blocks(
         self,

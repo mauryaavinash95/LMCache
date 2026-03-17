@@ -236,6 +236,22 @@ class KVStreamDiskBackend(StorageBackendInterface):
             drain_interval,
         )
 
+        # -- Deferred write support ---------------------------------------
+        # When enabled, batched_submit_put_task buffers writes instead of
+        # calling engine.save() immediately.  The caller (start_load_kv)
+        # calls flush_deferred_writes() after all reads for the current
+        # step are done, ensuring reads run on the NVMe without write
+        # contention.  Enabled by default for KVStream.
+        self._deferred_writes_enabled: bool = bool(
+            extra.get("kvstream_deferred_writes", True)
+        )
+        # Each entry: (io_hash, raw_tensor, path, offset, inflight_entry)
+        self._deferred_queue: list[
+            tuple[str, "torch.Tensor", str, int, _InflightEntry]
+        ] = []
+        if self._deferred_writes_enabled:
+            logger.info("KVStream deferred writes enabled")
+
     # ------------------------------------------------------------------ #
     #  String / helpers                                                    #
     # ------------------------------------------------------------------ #
@@ -734,14 +750,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
 
             io_hash = self._next_io_hash(key, "save")
 
-            # Submit non-blocking SQE to the C++ write engine.
-            # The C++ engine queues the entry internally and a background
-            # flushing thread submits it to io_uring, absorbing any
-            # backpressure from a full SQ ring.
-            self.engine.save(io_hash, raw_tensor, path, 0)
-
-            # Record in inflight dict for later drain
-            self._inflight[io_hash] = (
+            inflight_entry: _InflightEntry = (
                 key,
                 memory_obj,
                 size,
@@ -751,6 +760,46 @@ class KVStreamDiskBackend(StorageBackendInterface):
                 cached_positions,
                 on_complete_callback,
             )
+
+            if self._deferred_writes_enabled:
+                # Buffer write for later submission — the caller
+                # (start_load_kv) will call flush_deferred_writes()
+                # after all reads for the current step complete.
+                self._deferred_queue.append(
+                    (io_hash, raw_tensor, path, 0, inflight_entry)
+                )
+            else:
+                # Submit non-blocking SQE to the C++ write engine
+                # immediately (original behaviour).
+                self.engine.save(io_hash, raw_tensor, path, 0)
+                self._inflight[io_hash] = inflight_entry
+
+    def flush_deferred_writes(self) -> int:
+        """Submit all deferred writes to the C++ io_uring engine.
+
+        Called by the KV connector (``start_load_kv``) after all disk
+        reads for the current step have completed, so that writes never
+        contend with reads on the NVMe device.
+
+        Returns:
+            Number of writes flushed.
+        """
+        if not self._deferred_queue:
+            return 0
+
+        self._drain_completed()  # reap any prior completions first
+
+        n = 0
+        for io_hash, raw_tensor, path, offset, inflight_entry in (
+            self._deferred_queue
+        ):
+            self.engine.save(io_hash, raw_tensor, path, offset)
+            self._inflight[io_hash] = inflight_entry
+            n += 1
+
+        self._deferred_queue.clear()
+        logger.debug("KVStream: flushed %d deferred writes", n)
+        return n
 
     # ------------------------------------------------------------------ #
     #  Get (read) path                                                     #
@@ -1119,6 +1168,14 @@ class KVStreamDiskBackend(StorageBackendInterface):
            that completed during shutdown.
         4. Closes the batched message sender.
         """
+        # Flush any deferred writes before shutting down so they are
+        # submitted to the C++ engine and can complete during shutdown.
+        n_flushed = self.flush_deferred_writes()
+        if n_flushed:
+            logger.info(
+                "KVStream: flushed %d deferred writes during close", n_flushed
+            )
+
         # Stop background drain thread
         self._drain_stop.set()
         self._drain_thread.join(timeout=2.0)
