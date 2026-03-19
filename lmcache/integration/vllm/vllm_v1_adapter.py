@@ -790,6 +790,21 @@ class LMCacheConnectorV1Impl:
 
         assert self.lmcache_engine is not None
 
+        # Early unpin: release lookup pins from previous forward steps to
+        # prevent pin accumulation and deadlock.  When use_layerwise=True
+        # and CPU memory is full, allocate(busy_loop=True) on the asyncio
+        # thread spins waiting for evictable entries.  But all entries are
+        # pinned by previous lookups, and lookup_unpin (in wait_for_save)
+        # may not have run yet because stores are still in progress.
+        # By this point the previous batch's retrieve_layer generators are
+        # fully consumed (data is on GPU, ref_count_down already happened),
+        # so these pins are the sole barrier to eviction.  Releasing them
+        # lets allocate() reclaim CPU memory for the new batch's
+        # disk-to-host transfers.
+        stale_pin_ids = list(self.lmcache_engine.lookup_pins.keys())
+        for pin_id in stale_pin_ids:
+            self.lmcache_engine.lookup_unpin(pin_id)
+
         self.layerwise_retrievers = []
 
         for idx, request in enumerate(metadata.requests):

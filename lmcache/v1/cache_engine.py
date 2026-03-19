@@ -1049,7 +1049,7 @@ class LMCacheEngine:
             mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
             next(mem_obj_consumer)
 
-            to_count_down = []
+            to_count_down: list = []
             for layer_id in range(self.num_layers):
                 task = next(get_generator)
 
@@ -1064,10 +1064,41 @@ class LMCacheEngine:
 
                 mem_objs_layer = task.result()
                 mem_obj_consumer.send(mem_objs_layer)
-                to_count_down.extend(mem_objs_layer)
 
-            for mem_obj in to_count_down:
-                mem_obj.ref_count_down()
+                if self.layerwise_multi_location:
+                    # After send() returns, torch.cuda.synchronize()
+                    # has completed inside batched_to_gpu — the CPU
+                    # memory for this layer is no longer needed.
+                    #
+                    # Release per-layer to keep peak CPU memory at
+                    # ~N_chunks instead of N_chunks * num_layers.
+                    for i, mem_obj in enumerate(mem_objs_layer):
+                        if chunk_locations[i] != "LocalCPUBackend":
+                            # Disk-loaded temporary MemoryObj: unpin
+                            # the standalone pin set in
+                            # batched_get_non_blocking, then release
+                            # the ref (1→0) which triggers free().
+                            mem_obj.unpin()
+                        mem_obj.ref_count_down()
+
+                    # Unpin CPU hot_cache entries by key (covers
+                    # lookup pins) so they become evictable.
+                    cpu_layer_keys = [
+                        keys_layer_major[layer_id][i]
+                        for i in range(len(chunk_locations))
+                        if chunk_locations[i] == "LocalCPUBackend"
+                    ]
+                    if cpu_layer_keys:
+                        assert self.storage_manager is not None
+                        self.storage_manager.batched_unpin(
+                            cpu_layer_keys
+                        )
+                else:
+                    to_count_down.extend(mem_objs_layer)
+
+            if not self.layerwise_multi_location:
+                for mem_obj in to_count_down:
+                    mem_obj.ref_count_down()
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`

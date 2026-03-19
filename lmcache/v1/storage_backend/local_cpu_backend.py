@@ -675,26 +675,39 @@ class LocalCPUBackend(AllocatorBackendInterface):
                         self.hot_cache, num_candidates=num_candidates
                     )
 
-                    # HACK: We assume batch_size=num_layers here.
-                    # FIXME: We also assume if the one layer's ref_count > 1 or pinned,
-                    # then the other layers are also ref_count > 1 or
-                    # pinned in the cpu memory. This might not be true.
                     if evict_keys:
-                        evict_keys_count += len(evict_keys)
                         wait_other_requests = False
                         for evict_key in evict_keys:
                             evict_key_all_layer = evict_key.split_layers(batch_size)
 
-                            # TODO(Jiayi): batched allocate is not supported through
-                            # `batched_remove`. Therefore, features like usage tracking
-                            # is not supported.
-                            old_mem_objs = []
+                            # Verify ALL layers are evictable before
+                            # proceeding.  get_evict_candidates only
+                            # checks layer 0; other layers may have
+                            # ref_count > 1 (in-flight disk write) or
+                            # be pinned (concurrent lookup on the
+                            # lookup-server thread).
+                            all_evictable = True
+                            for key in evict_key_all_layer:
+                                mem_obj = self.hot_cache.get(key)
+                                if mem_obj is not None and not mem_obj.can_evict:
+                                    all_evictable = False
+                                    break
+                            if not all_evictable:
+                                continue
+
+                            evict_keys_count += 1
                             for key in evict_key_all_layer:
                                 mem_obj = self.hot_cache.get(key)
                                 if mem_obj is not None:
-                                    old_mem_objs.append(mem_obj)
                                     self.cache_policy.update_on_force_evict(key)
                                     self.hot_cache.pop(key, None)
+                                    # Use ref_count_down instead of
+                                    # batched_free to properly respect
+                                    # the ref_count lifecycle.  The
+                                    # MemoryObj is only freed (and
+                                    # invalidated) when ref_count
+                                    # reaches 0.
+                                    mem_obj.ref_count_down()
                                 else:
                                     logger.debug(
                                         f"Layer key {key} not in hot_cache "
@@ -702,10 +715,10 @@ class LocalCPUBackend(AllocatorBackendInterface):
                                         "or already evicted); skipping."
                                     )
 
-                            self.memory_allocator.batched_free(old_mem_objs)
-
                             logger.debug(
-                                f"Evicting {len(old_mem_objs)} chunks from cpu memory"
+                                "Evicted chunk %s (%d layers) from cpu memory",
+                                evict_key,
+                                len(evict_key_all_layer),
                             )
                     else:
                         self.stats_monitor.update_local_cpu_evict_failed_count(
