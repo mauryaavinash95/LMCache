@@ -157,7 +157,6 @@ class LMCacheEngine:
         self.event_manager = EventManager()
 
         self.use_layerwise = config.use_layerwise
-        self.layerwise_multi_location = config.kvstream_layerwise_multi_location
 
         # TODO: support save_only_first_rank when use layerwise
         # if use_layerwise is True, all ranks will initialize the storage_manager
@@ -998,23 +997,6 @@ class LMCacheEngine:
             if current_location := self.storage_manager.contains(keys_multi_layer[0]):
                 if location is None:
                     location = current_location
-                elif location != current_location:
-                    if not self.layerwise_multi_location:
-                        # KVStream fix: the original assertion crashes when
-                        # CPU LRU eviction causes chunks' layer-0 keys to
-                        # land in different backends (e.g. CPU vs disk).
-                        # Instead of crashing, truncate the prefix match
-                        # here so we only use the contiguous single-backend
-                        # prefix.  Enable kvstream_layerwise_multi_location
-                        # to allow true multi-location retrieval.
-                        #
-                        # assert location == current_location, (
-                        #     "All retrieved keys should be from the same "
-                        #     "location when use layerwise retrieval. "
-                        #     "Enable kvstream_layerwise_multi_location "
-                        #     "to allow multi-location retrieval."
-                        # )
-                        break
                 chunk_locations.append(current_location)
             else:
                 break
@@ -1029,7 +1011,10 @@ class LMCacheEngine:
             # Transpose the keys into layer major format
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
 
-            # Fast path: all chunks in the same backend (common case)
+            # Fast path: all chunks in the same backend (common case).
+            # When chunks span backends (e.g. some on CPU, some on
+            # disk after LRU eviction), use the multi-location path
+            # which routes each chunk to its backend per layer.
             unique_locations = set(chunk_locations)
             if len(unique_locations) == 1:
                 get_generator = self.storage_manager.layerwise_batched_get(
@@ -1064,32 +1049,10 @@ class LMCacheEngine:
 
                 mem_objs_layer = task.result()
                 mem_obj_consumer.send(mem_objs_layer)
+                to_count_down.extend(mem_objs_layer)
 
-                if self.layerwise_multi_location:
-                    # After send() returns, torch.cuda.synchronize()
-                    # has completed inside batched_to_gpu — the CPU
-                    # memory for this layer is no longer needed.
-                    #
-                    # For disk-loaded temporary MemoryObjs: unpin the
-                    # standalone pin set in batched_get_non_blocking,
-                    # then release the ref (1→0) which triggers free().
-                    #
-                    # For CPU hot_cache MemoryObjs: only release the
-                    # ref that batched_get_non_blocking added via
-                    # ref_count_up().  The lookup pin is owned by
-                    # lookup_unpin() (called from start_load_kv early
-                    # unpin or wait_for_save) — unpinning here too
-                    # would cause a double-unpin.
-                    for i, mem_obj in enumerate(mem_objs_layer):
-                        if chunk_locations[i] != "LocalCPUBackend":
-                            mem_obj.unpin()
-                        mem_obj.ref_count_down()
-                else:
-                    to_count_down.extend(mem_objs_layer)
-
-            if not self.layerwise_multi_location:
-                for mem_obj in to_count_down:
-                    mem_obj.ref_count_down()
+            for mem_obj in to_count_down:
+                mem_obj.ref_count_down()
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
@@ -1175,11 +1138,6 @@ class LMCacheEngine:
 
             # TODO: support batched_contains when layerwise is enabled
             if self.use_layerwise:
-                # Track the dominant chunk-level location so that
-                # retrieve_layer() (which checks layer-0 per chunk)
-                # never encounters an unexpected location change.
-                dominant_chunk_location: Optional[str] = None
-
                 for start, end, key in chunk_info_iterator:
                     assert isinstance(key, CacheEngineKey)
 
@@ -1192,41 +1150,19 @@ class LMCacheEngine:
                         search_range,
                         pin,
                     )
-                    # All layers must be present.  When multi-location is
-                    # enabled, layers may span backends (e.g. CPU + disk);
-                    # otherwise we additionally require a single location.
-                    all_layers_hit = hit_chunks == self.num_layers
-                    single_location = len(block_mapping) == 1
-                    if all_layers_hit and (
-                        self.layerwise_multi_location or single_location
-                    ):
-                        # When multi-location is disabled, ensure that
-                        # all chunks resolve to the same backend.  This
-                        # keeps lookup() consistent with retrieve_layer()
-                        # which breaks on cross-chunk location changes.
-                        if not self.layerwise_multi_location:
-                            chunk_loc = next(iter(block_mapping.keys()))
-                            if dominant_chunk_location is None:
-                                dominant_chunk_location = chunk_loc
-                            elif chunk_loc != dominant_chunk_location:
-                                # Unpin the keys that batched_contains
-                                # just pinned for this rejected chunk to
-                                # avoid a pin leak.
-                                if pin:
-                                    for loc, pinned_keys in block_mapping.items():
-                                        self.storage_manager.batched_unpin(
-                                            pinned_keys, [loc]
-                                        )
-                                return res
-
+                    # Only all layers are hit and hit in one location,
+                    # we consider this key as a hit.  When chunks span
+                    # backends (e.g. CPU + disk after LRU eviction),
+                    # retrieve_layer handles multi-location routing.
+                    if hit_chunks == self.num_layers and len(block_mapping) == 1:
                         if pin:
                             assert lookup_id is not None, (
                                 "lookup_id is required when pin is True"
                             )
-                            for loc, pinned_keys in block_mapping.items():
-                                self.lookup_pins[lookup_id][loc].extend(
-                                    pinned_keys
-                                )
+                            location = next(iter(block_mapping.keys()))
+                            self.lookup_pins[lookup_id][location].extend(
+                                key_all_layers
+                            )
                         res = end
                         continue
                     return res
