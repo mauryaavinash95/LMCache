@@ -77,6 +77,14 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.layerwise = config.use_layerwise
         self.enable_blending = config.enable_blending
 
+        # In layerwise mode, store num_layers so that eviction in
+        # allocate() can remove all layers of a chunk atomically
+        # (matching the batched_allocate eviction path).
+        if self.layerwise and metadata is not None:
+            self.num_layers: int = metadata.kv_shape[0]
+        else:
+            self.num_layers = 0
+
         # Store config and metadata for chunk budget calculation
         self.config = config
         self.metadata = metadata
@@ -546,12 +554,48 @@ class LocalCPUBackend(AllocatorBackendInterface):
                         # we can continue trying to evict from the hot_cache
                         # and don't need to wait for other requests yet
                         wait_other_requests = False
-                        logger.debug(
-                            f"Evicting {len(evict_keys)} chunks from cpu memory"
-                        )
-                        # remove
-                        self.batched_remove(evict_keys, force=False)
-                        evict_keys_count += len(evict_keys)
+
+                        if self.layerwise and self.num_layers > 0:
+                            # In layerwise mode, evict all layers of the
+                            # chunk atomically — matching batched_allocate's
+                            # eviction path.  This prevents partial-chunk
+                            # state in hot_cache that would cause KeyError
+                            # when batched_allocate later tries to evict
+                            # the same chunk via split_layers().
+                            for evict_key in evict_keys:
+                                evict_key_all_layer = (
+                                    evict_key.split_layers(self.num_layers)
+                                )
+                                old_mem_objs = []
+                                for key in evict_key_all_layer:
+                                    if key in self.hot_cache:
+                                        old_mem_objs.append(
+                                            self.hot_cache[key]
+                                        )
+                                        self.cache_policy.update_on_force_evict(
+                                            key
+                                        )
+                                        self.hot_cache.pop(key, None)
+
+                                if old_mem_objs:
+                                    self.memory_allocator.batched_free(
+                                        old_mem_objs
+                                    )
+
+                                logger.debug(
+                                    "Evicting %d layer-keys from cpu "
+                                    "memory (chunk-atomic)",
+                                    len(old_mem_objs),
+                                )
+                            evict_keys_count += len(evict_keys)
+                        else:
+                            logger.debug(
+                                f"Evicting {len(evict_keys)} chunks "
+                                "from cpu memory"
+                            )
+                            # remove
+                            self.batched_remove(evict_keys, force=False)
+                            evict_keys_count += len(evict_keys)
                     else:
                         self.stats_monitor.update_local_cpu_evict_failed_count(
                             num_candidates
