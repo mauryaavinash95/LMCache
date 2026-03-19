@@ -514,26 +514,33 @@ class StorageManager:
         location: Optional[str] = None,
     ) -> Generator[Future, None, None]:
         """
-        Non-blocking function to get the memory objects into the storages
+        Non-blocking function to get the memory objects from the storages
         in a layerwise manner.
-        Do not store if the same object is being stored (handled here by
-        storage manager) or has been stored (handled by storage backend).
+
+        Delegates to :meth:`layerwise_batched_get_multi_location` with a
+        uniform hint location so that per-key existence checks and
+        fallback to other backends are applied.  This prevents crashes
+        when CPU eviction moves individual layer-keys to disk between
+        the ``lookup()`` and ``retrieve_layer()`` calls.
 
         :param List[List[CacheEngineKey]] keys: The keys to get. The first
             dimension corresponds to the number of layers, and the second
             dimension corresponds to the number of chunks.
 
+        :param Optional[str] location: The expected backend for all
+            chunks.  Defaults to ``"LocalCPUBackend"``.
+
         :return: A generator that yields a future for each layer.
         """
         if location is None:
             location = "LocalCPUBackend"
-        for keys_multi_chunk in keys:
-            # Retrieve all chunks for one layer
-            backend = self.storage_backends[location]
-            # TODO(Jiayi): need to make async loading and layerwise compatible
-            coro = backend.batched_get_non_blocking("fake_lookup_id", keys_multi_chunk)
-            task = asyncio.run_coroutine_threadsafe(coro, self.loop)
-            yield task
+        # Build a uniform hint-location list and delegate to the
+        # multi-location path which does per-key existence checks.
+        num_chunks = len(keys[0]) if keys else 0
+        chunk_locations = [location] * num_chunks
+        yield from self.layerwise_batched_get_multi_location(
+            keys, chunk_locations
+        )
 
     def layerwise_batched_get_multi_location(
         self,
@@ -575,22 +582,62 @@ class StorageManager:
         self,
         keys_for_layer: List[CacheEngineKey],
         chunk_locations: List[str],
-    ) -> List[MemoryObj]:
+    ) -> List[Optional[MemoryObj]]:
         """Fetch one layer's chunks from multiple backends and merge.
+
+        The *chunk_locations* list provides the expected backend for each
+        chunk (determined from layer 0 during ``retrieve_layer``).
+        Because CPU eviction is per-key, higher layers may have migrated
+        to a different backend (e.g. evicted from CPU but still on disk).
+        We verify each key's actual location before fetching and fall
+        back to other backends when the expected one no longer holds the
+        key.
 
         :param List[CacheEngineKey] keys_for_layer: One key per chunk for a
             single layer.
-        :param List[str] chunk_locations: Per-chunk backend name (same
+        :param List[str] chunk_locations: Per-chunk backend name hint (same
             length as *keys_for_layer*).
 
-        :return: ``List[MemoryObj]`` in original chunk order.
+        :return: ``List[Optional[MemoryObj]]`` in original chunk order.
+            Entries are ``None`` only if the key is missing from *all*
+            backends (unrecoverable data loss).
         """
-        # ---- partition chunks by backend location ----
+        # ---- discover actual per-key locations ----
+        # Fast path: check the hinted location first (single dict lookup
+        # + lock, ~1 µs).  Only fall back to scanning other backends
+        # when the hint is stale.
+        actual_locations: List[Optional[str]] = []
+        for key, hint_loc in zip(keys_for_layer, chunk_locations):
+            hint_backend = self.storage_backends[hint_loc]
+            if hint_backend.contains(key, pin=False):
+                actual_locations.append(hint_loc)
+            else:
+                # Key was evicted from the hinted backend.  Search the
+                # remaining backends (typically just one: disk if hint
+                # was CPU, or CPU if hint was disk).
+                found: Optional[str] = None
+                for name, be in self.storage_backends.items():
+                    if name == hint_loc:
+                        continue
+                    if be.contains(key, pin=False):
+                        found = name
+                        break
+                if found is None:
+                    logger.warning(
+                        "layerwise multi-loc: key %s missing from all "
+                        "backends (expected %s)",
+                        key,
+                        hint_loc,
+                    )
+                actual_locations.append(found)
+
+        # ---- partition by actual location ----
         location_groups: Dict[str, List[Tuple[int, CacheEngineKey]]] = {}
         for idx, (key, loc) in enumerate(
-            zip(keys_for_layer, chunk_locations)
+            zip(keys_for_layer, actual_locations)
         ):
-            location_groups.setdefault(loc, []).append((idx, key))
+            if loc is not None:
+                location_groups.setdefault(loc, []).append((idx, key))
 
         # ---- kick off fetches concurrently via asyncio.gather ----
         results: List[Optional[MemoryObj]] = [None] * len(keys_for_layer)
@@ -628,7 +675,7 @@ class StorageManager:
                         wb_keys, cast(List[MemoryObj], wb_objs)
                     )
 
-        return cast(List[MemoryObj], results)
+        return results
 
     def prefetch_single_done_callback(
         self,

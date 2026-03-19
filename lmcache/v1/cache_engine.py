@@ -1000,12 +1000,21 @@ class LMCacheEngine:
                     location = current_location
                 elif location != current_location:
                     if not self.layerwise_multi_location:
-                        assert location == current_location, (
-                            "All retrieved keys should be from the same "
-                            "location when use layerwise retrieval. "
-                            "Enable kvstream_layerwise_multi_location "
-                            "to allow multi-location retrieval."
-                        )
+                        # KVStream fix: the original assertion crashes when
+                        # CPU LRU eviction causes chunks' layer-0 keys to
+                        # land in different backends (e.g. CPU vs disk).
+                        # Instead of crashing, truncate the prefix match
+                        # here so we only use the contiguous single-backend
+                        # prefix.  Enable kvstream_layerwise_multi_location
+                        # to allow true multi-location retrieval.
+                        #
+                        # assert location == current_location, (
+                        #     "All retrieved keys should be from the same "
+                        #     "location when use layerwise retrieval. "
+                        #     "Enable kvstream_layerwise_multi_location "
+                        #     "to allow multi-location retrieval."
+                        # )
+                        break
                 chunk_locations.append(current_location)
             else:
                 break
@@ -1144,6 +1153,11 @@ class LMCacheEngine:
 
             # TODO: support batched_contains when layerwise is enabled
             if self.use_layerwise:
+                # Track the dominant chunk-level location so that
+                # retrieve_layer() (which checks layer-0 per chunk)
+                # never encounters an unexpected location change.
+                dominant_chunk_location: Optional[str] = None
+
                 for start, end, key in chunk_info_iterator:
                     assert isinstance(key, CacheEngineKey)
 
@@ -1164,6 +1178,25 @@ class LMCacheEngine:
                     if all_layers_hit and (
                         self.layerwise_multi_location or single_location
                     ):
+                        # When multi-location is disabled, ensure that
+                        # all chunks resolve to the same backend.  This
+                        # keeps lookup() consistent with retrieve_layer()
+                        # which breaks on cross-chunk location changes.
+                        if not self.layerwise_multi_location:
+                            chunk_loc = next(iter(block_mapping.keys()))
+                            if dominant_chunk_location is None:
+                                dominant_chunk_location = chunk_loc
+                            elif chunk_loc != dominant_chunk_location:
+                                # Unpin the keys that batched_contains
+                                # just pinned for this rejected chunk to
+                                # avoid a pin leak.
+                                if pin:
+                                    for loc, pinned_keys in block_mapping.items():
+                                        self.storage_manager.batched_unpin(
+                                            pinned_keys, [loc]
+                                        )
+                                return res
+
                         if pin:
                             assert lookup_id is not None, (
                                 "lookup_id is required when pin is True"
