@@ -1070,29 +1070,20 @@ class LMCacheEngine:
                     # has completed inside batched_to_gpu — the CPU
                     # memory for this layer is no longer needed.
                     #
-                    # Release per-layer to keep peak CPU memory at
-                    # ~N_chunks instead of N_chunks * num_layers.
+                    # For disk-loaded temporary MemoryObjs: unpin the
+                    # standalone pin set in batched_get_non_blocking,
+                    # then release the ref (1→0) which triggers free().
+                    #
+                    # For CPU hot_cache MemoryObjs: only release the
+                    # ref that batched_get_non_blocking added via
+                    # ref_count_up().  The lookup pin is owned by
+                    # lookup_unpin() (called from start_load_kv early
+                    # unpin or wait_for_save) — unpinning here too
+                    # would cause a double-unpin.
                     for i, mem_obj in enumerate(mem_objs_layer):
                         if chunk_locations[i] != "LocalCPUBackend":
-                            # Disk-loaded temporary MemoryObj: unpin
-                            # the standalone pin set in
-                            # batched_get_non_blocking, then release
-                            # the ref (1→0) which triggers free().
                             mem_obj.unpin()
                         mem_obj.ref_count_down()
-
-                    # Unpin CPU hot_cache entries by key (covers
-                    # lookup pins) so they become evictable.
-                    cpu_layer_keys = [
-                        keys_layer_major[layer_id][i]
-                        for i in range(len(chunk_locations))
-                        if chunk_locations[i] == "LocalCPUBackend"
-                    ]
-                    if cpu_layer_keys:
-                        assert self.storage_manager is not None
-                        self.storage_manager.batched_unpin(
-                            cpu_layer_keys
-                        )
                 else:
                     to_count_down.extend(mem_objs_layer)
 

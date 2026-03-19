@@ -517,30 +517,29 @@ class StorageManager:
         Non-blocking function to get the memory objects from the storages
         in a layerwise manner.
 
-        Delegates to :meth:`layerwise_batched_get_multi_location` with a
-        uniform hint location so that per-key existence checks and
-        fallback to other backends are applied.  This prevents crashes
-        when CPU eviction moves individual layer-keys to disk between
-        the ``lookup()`` and ``retrieve_layer()`` calls.
+        This is the fast path for single-location retrieval: all chunks
+        are known to reside in the same backend, so we call
+        ``batched_get_non_blocking`` directly without per-key existence
+        checks.
 
         :param List[List[CacheEngineKey]] keys: The keys to get. The first
             dimension corresponds to the number of layers, and the second
             dimension corresponds to the number of chunks.
 
-        :param Optional[str] location: The expected backend for all
-            chunks.  Defaults to ``"LocalCPUBackend"``.
+        :param Optional[str] location: The backend holding all chunks.
+            Defaults to ``"LocalCPUBackend"``.
 
         :return: A generator that yields a future for each layer.
         """
         if location is None:
             location = "LocalCPUBackend"
-        # Build a uniform hint-location list and delegate to the
-        # multi-location path which does per-key existence checks.
-        num_chunks = len(keys[0]) if keys else 0
-        chunk_locations = [location] * num_chunks
-        yield from self.layerwise_batched_get_multi_location(
-            keys, chunk_locations
-        )
+        for keys_multi_chunk in keys:
+            # Retrieve all chunks for one layer
+            backend = self.storage_backends[location]
+            # TODO(Jiayi): need to make async loading and layerwise compatible
+            coro = backend.batched_get_non_blocking("fake_lookup_id", keys_multi_chunk)
+            task = asyncio.run_coroutine_threadsafe(coro, self.loop)
+            yield task
 
     def layerwise_batched_get_multi_location(
         self,
