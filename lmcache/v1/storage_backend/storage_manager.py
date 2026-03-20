@@ -561,22 +561,40 @@ class StorageManager:
         ):
             num_chunks = len(keys[0])
             num_layers = len(keys)
-            # Allocate all layers for each chunk upfront:
-            # pre_alloc_by_chunk[chunk_idx] = list of num_layers MemoryObjs
+            # Allocate all layers for each chunk upfront.
+            # Use busy_loop=False so that if CPU memory is under
+            # pressure (e.g. many chunks pinned by concurrent
+            # lookups) we fall back to the per-layer allocate()
+            # path inside the disk backend instead of spinning.
             pre_alloc_by_chunk: List[List[MemoryObj]] = []
+            alloc_ok = True
             for _ in range(num_chunks):
                 mem_objs = self.allocator_backend.batched_allocate(
                     kv_shape, kv_dtype, batch_size=num_layers, fmt=fmt,
+                    busy_loop=False,
                 )
-                assert mem_objs is not None, (
-                    "CPU memory exhausted during disk-read pre-allocation"
-                )
+                if mem_objs is None:
+                    alloc_ok = False
+                    break
                 pre_alloc_by_chunk.append(mem_objs)
-            # Transpose to layer-major: pre_alloc[layer_idx][chunk_idx]
-            pre_alloc = [
-                [pre_alloc_by_chunk[c][l] for c in range(num_chunks)]
-                for l in range(num_layers)
-            ]
+            if alloc_ok:
+                # Transpose to layer-major: pre_alloc[layer_idx][chunk_idx]
+                pre_alloc = [
+                    [pre_alloc_by_chunk[c][l] for c in range(num_chunks)]
+                    for l in range(num_layers)
+                ]
+            else:
+                # Free any partially-allocated chunks and fall back
+                # to per-layer allocation inside the disk backend.
+                for mem_list in pre_alloc_by_chunk:
+                    for mem_obj in mem_list:
+                        mem_obj.ref_count_down()
+                logger.warning(
+                    "Disk-read pre-allocation failed for %d chunks "
+                    "(CPU memory pressure); falling back to "
+                    "per-layer allocation.",
+                    num_chunks,
+                )
 
         for layer_idx, keys_multi_chunk in enumerate(keys):
             # TODO(Jiayi): need to make async loading and layerwise compatible
@@ -655,15 +673,28 @@ class StorageManager:
             ]
             if disk_chunk_indices:
                 disk_pre_alloc = {}
+                alloc_ok = True
                 for c in disk_chunk_indices:
                     mem_objs = self.allocator_backend.batched_allocate(
                         kv_shape, kv_dtype, batch_size=num_layers, fmt=fmt,
+                        busy_loop=False,
                     )
-                    assert mem_objs is not None, (
-                        "CPU memory exhausted during disk-read "
-                        "pre-allocation (multi-location)"
-                    )
+                    if mem_objs is None:
+                        alloc_ok = False
+                        break
                     disk_pre_alloc[c] = mem_objs
+                if not alloc_ok:
+                    # Free partial allocations and fall back to
+                    # per-layer allocation inside disk backend.
+                    for mem_list in disk_pre_alloc.values():
+                        for mem_obj in mem_list:
+                            mem_obj.ref_count_down()
+                    disk_pre_alloc = None
+                    logger.warning(
+                        "Disk-read pre-allocation failed for "
+                        "multi-location path (CPU memory pressure); "
+                        "falling back to per-layer allocation.",
+                    )
 
         for layer_idx, keys_multi_chunk in enumerate(keys):
             coro = self._fetch_layer_multi_location(
