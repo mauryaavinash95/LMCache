@@ -80,11 +80,6 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
-    "kvstream_layerwise_multi_location": {
-        "type": bool,
-        "default": False,
-        "env_converter": _to_bool,
-    },
     "remote_url": {
         "type": Optional[str],
         "default": None,

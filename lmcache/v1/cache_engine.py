@@ -1011,6 +1011,12 @@ class LMCacheEngine:
             # Transpose the keys into layer major format
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
 
+            # Shape / dtype for disk-read pre-allocation.  All chunks
+            # share the same per-layer shape (same chunk_size).
+            num_tokens = ends[0] - starts[0]
+            kv_shape = self.gpu_connector.get_shape(num_tokens)
+            kv_dtype = self.metadata.kv_dtype
+
             # Fast path: all chunks in the same backend (common case).
             # When chunks span backends (e.g. some on CPU, some on
             # disk after LRU eviction), use the multi-location path
@@ -1020,12 +1026,18 @@ class LMCacheEngine:
                 get_generator = self.storage_manager.layerwise_batched_get(
                     keys_layer_major,
                     location=chunk_locations[0],
+                    kv_shape=kv_shape,
+                    kv_dtype=kv_dtype,
+                    fmt=self.fmt,
                 )
             else:
                 get_generator = (
                     self.storage_manager.layerwise_batched_get_multi_location(
                         keys_layer_major,
                         chunk_locations,
+                        kv_shape=kv_shape,
+                        kv_dtype=kv_dtype,
+                        fmt=self.fmt,
                     )
                 )
 

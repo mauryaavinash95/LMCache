@@ -512,6 +512,9 @@ class StorageManager:
         self,
         keys: List[List[CacheEngineKey]],
         location: Optional[str] = None,
+        kv_shape: Optional[torch.Size] = None,
+        kv_dtype: Optional[torch.dtype] = None,
+        fmt: Optional[MemoryFormat] = None,
     ) -> Generator[Future, None, None]:
         """
         Non-blocking function to get the memory objects from the storages
@@ -522,22 +525,72 @@ class StorageManager:
         ``batched_get_non_blocking`` directly without per-key existence
         checks.
 
+        When the target backend is NOT the CPU allocator (i.e. a disk
+        backend), the caller should supply *kv_shape*, *kv_dtype* and
+        *fmt* so that all required CPU memory can be **pre-allocated**
+        in bulk before the layer loop starts.  This avoids per-layer
+        ``allocate()`` calls inside the disk backend that would
+        otherwise exhaust the memory pool mid-loop and deadlock.
+
         :param List[List[CacheEngineKey]] keys: The keys to get. The first
             dimension corresponds to the number of layers, and the second
             dimension corresponds to the number of chunks.
-
         :param Optional[str] location: The backend holding all chunks.
             Defaults to ``"LocalCPUBackend"``.
+        :param Optional[torch.Size] kv_shape: Single-layer KV shape for
+            pre-allocation (required when *location* is a disk backend).
+        :param Optional[torch.dtype] kv_dtype: KV dtype for
+            pre-allocation.
+        :param Optional[MemoryFormat] fmt: Memory format for
+            pre-allocation.
 
         :return: A generator that yields a future for each layer.
         """
         if location is None:
             location = "LocalCPUBackend"
-        for keys_multi_chunk in keys:
-            # Retrieve all chunks for one layer
-            backend = self.storage_backends[location]
+
+        backend = self.storage_backends[location]
+
+        # Pre-allocate CPU memory for disk reads.  For CPU reads the
+        # backend returns existing hot-cache MemoryObjs (no allocation).
+        pre_alloc: Optional[List[List[MemoryObj]]] = None
+        if (
+            location != "LocalCPUBackend"
+            and kv_shape is not None
+            and self.allocator_backend is not None
+        ):
+            num_chunks = len(keys[0])
+            num_layers = len(keys)
+            # Allocate all layers for each chunk upfront:
+            # pre_alloc_by_chunk[chunk_idx] = list of num_layers MemoryObjs
+            pre_alloc_by_chunk: List[List[MemoryObj]] = []
+            for _ in range(num_chunks):
+                mem_objs = self.allocator_backend.batched_allocate(
+                    kv_shape, kv_dtype, batch_size=num_layers, fmt=fmt,
+                )
+                assert mem_objs is not None, (
+                    "CPU memory exhausted during disk-read pre-allocation"
+                )
+                pre_alloc_by_chunk.append(mem_objs)
+            # Transpose to layer-major: pre_alloc[layer_idx][chunk_idx]
+            pre_alloc = [
+                [pre_alloc_by_chunk[c][l] for c in range(num_chunks)]
+                for l in range(num_layers)
+            ]
+
+        for layer_idx, keys_multi_chunk in enumerate(keys):
             # TODO(Jiayi): need to make async loading and layerwise compatible
-            coro = backend.batched_get_non_blocking("fake_lookup_id", keys_multi_chunk)
+            if pre_alloc is not None:
+                coro = backend.batched_get_non_blocking(
+                    "fake_lookup_id",
+                    keys_multi_chunk,
+                    memory_objs=pre_alloc[layer_idx],
+                )
+            else:
+                coro = backend.batched_get_non_blocking(
+                    "fake_lookup_id",
+                    keys_multi_chunk,
+                )
             task = asyncio.run_coroutine_threadsafe(coro, self.loop)
             yield task
 
@@ -545,6 +598,9 @@ class StorageManager:
         self,
         keys: List[List[CacheEngineKey]],
         chunk_locations: List[str],
+        kv_shape: Optional[torch.Size] = None,
+        kv_dtype: Optional[torch.dtype] = None,
+        fmt: Optional[MemoryFormat] = None,
     ) -> Generator[Future, None, None]:
         """Layerwise retrieval when chunks reside in different backends.
 
@@ -559,20 +615,61 @@ class StorageManager:
         ``LocalCPUBackend`` hot-cache so that future lookups find them on
         the faster tier.
 
+        When *kv_shape*, *kv_dtype* and *fmt* are provided, CPU memory
+        for all disk-bound chunks is pre-allocated in bulk before the
+        layer loop starts (same rationale as
+        :meth:`layerwise_batched_get`).
+
         :param List[List[CacheEngineKey]] keys: Layer-major key matrix.
             ``keys[layer_idx][chunk_idx]`` is the key for that
             (layer, chunk) pair.
         :param List[str] chunk_locations: Per-chunk backend name returned by
             ``StorageManager.contains()`` for layer 0 of each chunk.  Length
             must equal ``len(keys[0])``.
+        :param Optional[torch.Size] kv_shape: Single-layer KV shape for
+            pre-allocation.
+        :param Optional[torch.dtype] kv_dtype: KV dtype for
+            pre-allocation.
+        :param Optional[MemoryFormat] fmt: Memory format for
+            pre-allocation.
 
         :return: A generator that yields a :class:`Future` for each layer.
             Each future resolves to ``List[MemoryObj]`` in original chunk
             order.
         """
-        for keys_multi_chunk in keys:
+        # Pre-allocate CPU memory for disk-bound chunks.
+        # disk_pre_alloc[chunk_idx][layer_idx] = MemoryObj, only for
+        # chunks whose location != "LocalCPUBackend".
+        # disk_chunk_indices tracks which chunk indices are on disk.
+        disk_pre_alloc: Optional[
+            Dict[int, List[MemoryObj]]
+        ] = None
+        if (
+            kv_shape is not None
+            and self.allocator_backend is not None
+        ):
+            num_layers = len(keys)
+            disk_chunk_indices = [
+                i for i, loc in enumerate(chunk_locations)
+                if loc != "LocalCPUBackend"
+            ]
+            if disk_chunk_indices:
+                disk_pre_alloc = {}
+                for c in disk_chunk_indices:
+                    mem_objs = self.allocator_backend.batched_allocate(
+                        kv_shape, kv_dtype, batch_size=num_layers, fmt=fmt,
+                    )
+                    assert mem_objs is not None, (
+                        "CPU memory exhausted during disk-read "
+                        "pre-allocation (multi-location)"
+                    )
+                    disk_pre_alloc[c] = mem_objs
+
+        for layer_idx, keys_multi_chunk in enumerate(keys):
             coro = self._fetch_layer_multi_location(
-                keys_multi_chunk, chunk_locations
+                keys_multi_chunk, chunk_locations,
+                disk_pre_alloc=disk_pre_alloc,
+                layer_idx=layer_idx,
             )
             task = asyncio.run_coroutine_threadsafe(coro, self.loop)
             yield task
@@ -581,6 +678,8 @@ class StorageManager:
         self,
         keys_for_layer: List[CacheEngineKey],
         chunk_locations: List[str],
+        disk_pre_alloc: Optional[Dict[int, List[MemoryObj]]] = None,
+        layer_idx: int = 0,
     ) -> List[Optional[MemoryObj]]:
         """Fetch one layer's chunks from multiple backends and merge.
 
@@ -647,11 +746,24 @@ class StorageManager:
             backend = self.storage_backends[loc]
             group_keys = [k for _, k in idx_key_pairs]
             group_indices = [i for i, _ in idx_key_pairs]
-            coros.append(
-                backend.batched_get_non_blocking(
-                    "layerwise_multi_loc", group_keys
+            if loc != "LocalCPUBackend" and disk_pre_alloc is not None:
+                # Use pre-allocated MemoryObjs for disk reads
+                group_mem_objs = [
+                    disk_pre_alloc[idx][layer_idx]
+                    for idx, _ in idx_key_pairs
+                ]
+                coros.append(
+                    backend.batched_get_non_blocking(
+                        "layerwise_multi_loc", group_keys,
+                        memory_objs=group_mem_objs,
+                    )
                 )
-            )
+            else:
+                coros.append(
+                    backend.batched_get_non_blocking(
+                        "layerwise_multi_loc", group_keys
+                    )
+                )
             indices_per_coro.append(group_indices)
 
         all_mem_objs = await asyncio.gather(*coros)
