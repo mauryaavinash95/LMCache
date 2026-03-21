@@ -983,7 +983,6 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         location = None
-        chunk_locations: List[str] = []
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens,
             mask=mask,
@@ -997,7 +996,13 @@ class LMCacheEngine:
             if current_location := self.storage_manager.contains(keys_multi_layer[0]):
                 if location is None:
                     location = current_location
-                chunk_locations.append(current_location)
+                else:
+                    # TODO(Jiayi): Support multi-location retrieval in the future
+                    assert location == current_location, (
+                        "All retrieved keys should be from the same location "
+                        "when use layerwise retrieval."
+                        "Please support multi-location retrieval in the future."
+                    )
             else:
                 break
 
@@ -1011,35 +1016,10 @@ class LMCacheEngine:
             # Transpose the keys into layer major format
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
 
-            # Shape / dtype for disk-read pre-allocation.  All chunks
-            # share the same per-layer shape (same chunk_size).
-            num_tokens = ends[0] - starts[0]
-            kv_shape = self.gpu_connector.get_shape(num_tokens)
-            kv_dtype = self.metadata.kv_dtype
-
-            # Fast path: all chunks in the same backend (common case).
-            # When chunks span backends (e.g. some on CPU, some on
-            # disk after LRU eviction), use the multi-location path
-            # which routes each chunk to its backend per layer.
-            unique_locations = set(chunk_locations)
-            if len(unique_locations) == 1:
-                get_generator = self.storage_manager.layerwise_batched_get(
-                    keys_layer_major,
-                    location=chunk_locations[0],
-                    kv_shape=kv_shape,
-                    kv_dtype=kv_dtype,
-                    fmt=self.fmt,
-                )
-            else:
-                get_generator = (
-                    self.storage_manager.layerwise_batched_get_multi_location(
-                        keys_layer_major,
-                        chunk_locations,
-                        kv_shape=kv_shape,
-                        kv_dtype=kv_dtype,
-                        fmt=self.fmt,
-                    )
-                )
+            get_generator = self.storage_manager.layerwise_batched_get(
+                keys_layer_major,
+                location=location,
+            )
 
             assert_layerwise_gpu_connector(self.gpu_connector)
 
@@ -1163,9 +1143,7 @@ class LMCacheEngine:
                         pin,
                     )
                     # Only all layers are hit and hit in one location,
-                    # we consider this key as a hit.  When chunks span
-                    # backends (e.g. CPU + disk after LRU eviction),
-                    # retrieve_layer handles multi-location routing.
+                    # we consider this key as a hit
                     if hit_chunks == self.num_layers and len(block_mapping) == 1:
                         if pin:
                             assert lookup_id is not None, (

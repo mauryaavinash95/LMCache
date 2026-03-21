@@ -790,21 +790,6 @@ class LMCacheConnectorV1Impl:
 
         assert self.lmcache_engine is not None
 
-        # Early unpin: release lookup pins from previous forward steps to
-        # prevent pin accumulation and deadlock.  When use_layerwise=True
-        # and CPU memory is full, allocate(busy_loop=True) on the asyncio
-        # thread spins waiting for evictable entries.  But all entries are
-        # pinned by previous lookups, and lookup_unpin (in wait_for_save)
-        # may not have run yet because stores are still in progress.
-        # By this point the previous batch's retrieve_layer generators are
-        # fully consumed (data is on GPU, ref_count_down already happened),
-        # so these pins are the sole barrier to eviction.  Releasing them
-        # lets allocate() reclaim CPU memory for the new batch's
-        # disk-to-host transfers.
-        stale_pin_ids = list(self.lmcache_engine.lookup_pins.keys())
-        for pin_id in stale_pin_ids:
-            self.lmcache_engine.lookup_unpin(pin_id)
-
         self.layerwise_retrievers = []
 
         for idx, request in enumerate(metadata.requests):
@@ -1180,25 +1165,12 @@ class LMCacheConnectorV1Impl:
             return
 
         if self.use_layerwise:
-            for layerwise_storer in self._layerwise_save_storers.values():
-                # next(layerwise_storer)
-                try:
-                    next(layerwise_storer)
-                except StopIteration:
-                    logger.debug(
-                        "Layerwise storer completed early during save_kv_layer; skipping."
-                    )
-
-            # unpin the kv caches according to req_id
             for request in connector_metadata.requests:
                 layerwise_storer = self._layerwise_save_storers.pop(
                     request.req_id, None
                 )
                 if layerwise_storer is not None:
-                    try:
-                        next(layerwise_storer)
-                    except StopIteration:
-                        pass
+                    next(layerwise_storer)
                 # unpin the kv caches according to req_id
                 self.lmcache_engine.lookup_unpin(request.req_id)
             return

@@ -676,6 +676,10 @@ class LocalCPUBackend(AllocatorBackendInterface):
                         self.hot_cache, num_candidates=num_candidates
                     )
 
+                    # HACK: We assume batch_size=num_layers here.
+                    # FIXME: We also assume if the one layer's ref_count > 1 or pinned,
+                    # then the other layers are also ref_count > 1 or
+                    # pinned in the cpu memory. This might not be true.
                     if evict_keys:
                         evict_keys_count += len(evict_keys)
                         wait_other_requests = False

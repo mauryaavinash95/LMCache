@@ -412,47 +412,40 @@ class LocalDiskBackend(StorageBackendInterface):
         lookup_id: str,
         keys: list[CacheEngineKey],
         transfer_spec: Any = None,
-        memory_objs: Optional[list[MemoryObj]] = None,
     ) -> list[MemoryObj]:
         mem_objs: list[MemoryObj] = []
         paths: list[str] = []
 
         logger.debug(f"lookup_id: {lookup_id}; Prefetching {len(keys)} keys from disk.")
-        for i, key in enumerate(keys):
+        for key in keys:
             self.disk_lock.acquire()
             assert key in self.dict, f"Key {key} not found in disk cache after pinning"
 
             path = self.dict[key].path
+            dtype = self.dict[key].dtype
+            shape = self.dict[key].shape
+            fmt = self.dict[key].fmt
 
-            if memory_objs is not None:
-                # Use pre-allocated MemoryObj (disk-read pre-allocation
-                # path).  Skip the per-key allocate() call.
-                memory_obj = memory_objs[i]
-            else:
-                dtype = self.dict[key].dtype
-                shape = self.dict[key].shape
-                fmt = self.dict[key].fmt
+            assert dtype is not None
+            assert shape is not None
 
-                assert dtype is not None
-                assert shape is not None
-
-                _alloc_t0 = time.time()
-                memory_obj = self.local_cpu_backend.allocate(
-                    shape,
-                    dtype,
-                    fmt,
+            _alloc_t0 = time.time()
+            memory_obj = self.local_cpu_backend.allocate(
+                shape,
+                dtype,
+                fmt,
+            )
+            _alloc_elapsed = time.time() - _alloc_t0
+            if _alloc_elapsed > 0.01:
+                logger.warning(
+                    "D2H allocate for disk read took %.3fs (key=%s)",
+                    _alloc_elapsed,
+                    key,
                 )
-                _alloc_elapsed = time.time() - _alloc_t0
-                if _alloc_elapsed > 0.01:
-                    logger.warning(
-                        "D2H allocate for disk read took %.3fs (key=%s)",
-                        _alloc_elapsed,
-                        key,
-                    )
 
-                assert memory_obj is not None, (
-                    "Memory allocation failed during async disk load."
-                )
+            assert memory_obj is not None, (
+                "Memory allocation failed during async disk load."
+            )
 
             self.dict[key].pin()
 
