@@ -883,6 +883,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
     #  Drain-based write completion bookkeeping (multi-engine)             #
     # ------------------------------------------------------------------ #
 
+    @_lmcache_nvtx_annotate
     def _drain_completed(self) -> None:
         """Poll **all** tier engines for completed and failed writes.
 
@@ -895,6 +896,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
         """
         with self._drain_lock:
             # Collect completions and failures across all tier engines
+            t0_drain = time.perf_counter()
             all_completed: list[str] = []
             all_failed: list[str] = []
             for tier in self._tiers:
@@ -917,6 +919,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
                     self._resolve_failed_group(group)
 
             # -- Process completions ----
+            groups_resolved = 0
             for io_hash in all_completed:
                 group = self._hash_to_group.pop(io_hash, None)
                 if group is None:
@@ -928,10 +931,23 @@ class KVStreamDiskBackend(StorageBackendInterface):
                     continue
                 group.remaining -= 1
                 if group.remaining == 0:
+                    groups_resolved += 1
                     if group.failed:
                         self._resolve_failed_group(group)
                     else:
                         self._resolve_completed_group(group)
+
+            n_total = len(all_completed) + len(all_failed)
+            if n_total > 0:
+                elapsed_ms = (time.perf_counter() - t0_drain) * 1e3
+                logger.debug(
+                    "KVStream drain: %d completed, %d failed, "
+                    "%d groups resolved in %.2f ms",
+                    len(all_completed),
+                    len(all_failed),
+                    groups_resolved,
+                    elapsed_ms,
+                )
 
     def _resolve_completed_group(self, group: _InflightGroup) -> None:
         """Finalize a successfully completed write group.
@@ -1155,10 +1171,13 @@ class KVStreamDiskBackend(StorageBackendInterface):
             else:
                 # Submit immediately
                 for engine, io_hash, raw_slice, path, foff in save_ops:
+                    torch.cuda.nvtx.range_push("kvs_save_imm")
                     engine.save(io_hash, raw_slice, path, foff)
+                    torch.cuda.nvtx.range_pop()
                 for h in group.io_hashes:
                     self._hash_to_group[h] = group
 
+    @_lmcache_nvtx_annotate
     def flush_deferred_writes(self) -> int:
         """Submit all deferred writes to the io_uring engines.
 
@@ -1173,22 +1192,35 @@ class KVStreamDiskBackend(StorageBackendInterface):
 
         self._drain_completed()
 
+        t0 = time.perf_counter()
         n = 0
+        total_bytes = 0
         for group, save_ops in self._deferred_queue:
             for engine, io_hash, raw_slice, path, foff in save_ops:
+                torch.cuda.nvtx.range_push("kvs_save_flush")
                 engine.save(io_hash, raw_slice, path, foff)
+                torch.cuda.nvtx.range_pop()
+                total_bytes += raw_slice.nbytes
             # Hashes are already registered in _hash_to_group during
             # batched_submit_put_task.
             n += 1
 
         self._deferred_queue.clear()
-        logger.debug("KVStream: flushed %d deferred writes", n)
+        elapsed_ms = (time.perf_counter() - t0) * 1e3
+        logger.debug(
+            "KVStream: flushed %d deferred writes, "
+            "%.2f MB in %.2f ms",
+            n,
+            total_bytes / 1e6,
+            elapsed_ms,
+        )
         return n
 
     # ------------------------------------------------------------------ #
     #  Get (read) path — P-tier layer-striped                             #
     # ------------------------------------------------------------------ #
 
+    @_lmcache_nvtx_annotate
     def _submit_tiered_loads(
         self,
         key: CacheEngineKey,
@@ -1232,13 +1264,18 @@ class KVStreamDiskBackend(StorageBackendInterface):
                 # File offset
                 file_offset = kv_idx * tier_layer_bytes
 
+                torch.cuda.nvtx.range_push(
+                    f"kvs_load_t{tier_slice.tier_index}_{kv_label}"
+                )
                 tier.engine.load(
                     io_hash, raw_slice, tier_slice.path, file_offset
                 )
+                torch.cuda.nvtx.range_pop()
                 load_refs.append((tier, io_hash))
 
         return load_refs
 
+    @_lmcache_nvtx_annotate
     def get_blocking(
         self, key: CacheEngineKey
     ) -> Optional[MemoryObj]:
@@ -1309,6 +1346,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
 
         return memory_obj
 
+    @_lmcache_nvtx_annotate
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
@@ -1404,6 +1442,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
     #  Overlapped read path (Level 2)                                      #
     # ------------------------------------------------------------------ #
 
+    @_lmcache_nvtx_annotate
     def submit_batch_load(
         self,
         keys: List[CacheEngineKey],
@@ -1463,6 +1502,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
 
         return results
 
+    @_lmcache_nvtx_annotate
     def wait_one_load(
         self,
         io_hash: str,
@@ -1477,10 +1517,14 @@ class KVStreamDiskBackend(StorageBackendInterface):
             memory_obj: The pre-allocated ``MemoryObj`` receiving data.
         """
         load_refs = self._overlapped_load_refs.pop(io_hash, [])
-        for tier, sub_hash in load_refs:
+        for tier_idx, (tier, sub_hash) in enumerate(load_refs):
+            torch.cuda.nvtx.range_push(
+                f"kvs_wait_t{tier_idx}"
+            )
             tier.engine.wait_one(
                 sub_hash, self.kvstream_core.IOQueue.READ
             )
+            torch.cuda.nvtx.range_pop()
 
         # Recover cached_positions metadata
         disk_meta = self.dict.get(key, None)
@@ -1634,6 +1678,66 @@ class KVStreamDiskBackend(StorageBackendInterface):
             The ``LocalCPUBackend`` instance.
         """
         return self.local_cpu_backend
+
+    def get_tier_read_stats(self) -> list[dict[str, Any]]:
+        """Snapshot per-tier read statistics (no reset).
+
+        Returns a list of dicts (one per tier) with read stats from the
+        C++ io_uring engines.  Does NOT reset counters.
+
+        Returns:
+            List of per-tier dicts with keys ``tier``,
+            ``read_bytes``, ``read_bw_mb_s``, ``read_elapsed_ms``.
+        """
+        IOQueue = self.kvstream_core.IOQueue
+        results: list[dict[str, Any]] = []
+        for i, tier in enumerate(self._tiers):
+            rs = tier.engine.get_stats(IOQueue.READ)
+            results.append({
+                "tier": i,
+                "read_bytes": rs.total_bytes_completed,
+                "read_bw_mb_s": round(rs.bandwidth_mb_s(), 1),
+                "read_elapsed_ms": round(
+                    rs.elapsed_us() / 1e3, 2
+                ),
+            })
+        return results
+
+    def get_tier_stats_and_reset(
+        self,
+    ) -> list[dict[str, Any]]:
+        """Snapshot and reset per-tier I/O statistics from C++ engines.
+
+        Returns a list of dicts (one per tier) with read and write
+        stats.  After returning, all engine counters are zeroed so the
+        next call reports a clean interval.
+
+        Returns:
+            List of per-tier stat dicts with keys:
+            ``tier``, ``read_bytes``, ``read_ops``, ``read_bw_mb_s``,
+            ``read_elapsed_ms``, ``write_bytes``, ``write_ops``,
+            ``write_bw_mb_s``, ``write_elapsed_ms``.
+        """
+        IOQueue = self.kvstream_core.IOQueue
+        results: list[dict[str, Any]] = []
+        for i, tier in enumerate(self._tiers):
+            rs = tier.engine.get_stats(IOQueue.READ)
+            ws = tier.engine.get_stats(IOQueue.WRITE)
+            results.append({
+                "tier": i,
+                "read_bytes": rs.total_bytes_completed,
+                "read_ops": rs.total_ops_completed,
+                "read_bw_mb_s": round(rs.bandwidth_mb_s(), 1),
+                "read_elapsed_ms": round(rs.elapsed_us() / 1e3, 2),
+                "read_retries": rs.total_retries,
+                "write_bytes": ws.total_bytes_completed,
+                "write_ops": ws.total_ops_completed,
+                "write_bw_mb_s": round(ws.bandwidth_mb_s(), 1),
+                "write_elapsed_ms": round(ws.elapsed_us() / 1e3, 2),
+            })
+            tier.engine.reset_stats(IOQueue.READ)
+            tier.engine.reset_stats(IOQueue.WRITE)
+        return results
 
     def close(self) -> None:
         """Shut down all KVStream tier engines and flush pending work.

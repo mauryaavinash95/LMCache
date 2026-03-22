@@ -579,6 +579,10 @@ class LMCacheConnectorV1Impl:
         # step's reads complete.
         self._kvstream_backend: Optional["KVStreamDiskBackend"] = None  # noqa: F821
         self._kvstream_deferred_checked: bool = False
+        # Per-tier stats from the previous step's reads, included in the
+        # next step's JSON log line.  Populated at the end of
+        # start_load_kv, consumed by _emit_step_log.
+        self._kvstream_last_tier_stats: list = []
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -925,6 +929,13 @@ class LMCacheConnectorV1Impl:
 
         self._flush_deferred_writes_if_enabled()
 
+        # Collect per-tier IO stats for the step log and reset counters.
+        if self._kvstream_backend is not None:
+            self._kvstream_last_tier_stats = (
+                self._kvstream_backend.get_tier_stats_and_reset()
+            )
+
+    @_lmcache_nvtx_annotate
     def _flush_deferred_writes_if_enabled(self) -> None:
         """Flush deferred KVStream writes from the previous step.
 
@@ -1823,6 +1834,11 @@ class LMCacheConnectorV1Impl:
         if decode_reqs > 0:
             step_data["decode_reqs"] = decode_reqs
             step_data["decode_tokens"] = decode_tokens
+        if self._kvstream_last_tier_stats:
+            step_data["kvstream_tiers"] = (
+                self._kvstream_last_tier_stats
+            )
+            self._kvstream_last_tier_stats = []
 
         logger.info(json.dumps(step_data, separators=(",", ":")))
 

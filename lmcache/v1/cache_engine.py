@@ -1893,6 +1893,17 @@ class LMCacheEngine:
         total_chunks = cpu_chunks + disk_chunks
         total_bytes_mb = (cpu_bytes + disk_bytes) / 1e6
 
+        # Collect per-tier C++ engine stats (snapshot only, no reset —
+        # the adapter resets after consuming for the step log).
+        tier_stats_list: list = []
+        if (
+            disk_chunks > 0
+            and isinstance(kvstream_backend, KVStreamDiskBackend)
+        ):
+            tier_stats_list = (
+                kvstream_backend.get_tier_read_stats()
+            )
+
         if total_chunks > 0:
             parts = [
                 f"rank={rank}",
@@ -1921,6 +1932,13 @@ class LMCacheEngine:
                     f"bw={disk_bw:.0f}MB/s/"
                     f"gpu_sync={t_gpu_sync * 1e3:.2f}ms"
                 )
+                for ts in tier_stats_list:
+                    parts.append(
+                        f"t{ts['tier']}_rd="
+                        f"{ts['read_bytes'] / 1e6:.1f}MB/"
+                        f"{ts['read_bw_mb_s']}MB_s/"
+                        f"{ts['read_elapsed_ms']}ms"
+                    )
             logger.info(
                 "overlapped_retrieve: %s", " | ".join(parts)
             )
