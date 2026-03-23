@@ -1141,6 +1141,13 @@ class LMCacheConnectorV1Impl:
                             **tgt.kwargs,
                         )
 
+                        # Promote disk-loaded chunk into CPU
+                        # hot_cache so future lookups find it
+                        # in CPU rather than going to disk.
+                        kvstream_be.local_cpu_backend.submit_put_task(
+                            rkey, memory_obj
+                        )
+
                         tgt.reordered_chunks.append(
                             (rkey, memory_obj, start, end)
                         )
