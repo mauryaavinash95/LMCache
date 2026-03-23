@@ -515,6 +515,17 @@ class KVStreamDiskBackend(StorageBackendInterface):
             str, list[tuple[_TierState, str]]
         ] = {}
 
+        # -- Completion-driven (wait_any) tracking -------------------------
+        # sub_hash -> group_hash: maps individual per-tier I/O hashes
+        # back to the chunk-level group hash.
+        self._sub_to_group: dict[str, str] = {}
+        # group_hash -> count of sub-hashes still pending.
+        self._group_pending_count: dict[str, int] = {}
+        # group_hash -> (key, memory_obj) for chunks awaiting completion.
+        self._group_meta: dict[
+            str, tuple[CacheEngineKey, MemoryObj]
+        ] = {}
+
         # -- Batched message sender (controller ADMIT/EVICT msgs) --------
         self.batched_msg_sender: Optional[BatchedMessageSender] = None
         if lmcache_worker and metadata is not None:
@@ -1498,6 +1509,12 @@ class KVStreamDiskBackend(StorageBackendInterface):
             group_hash = self._next_io_hash(key, "load_group")
             self._overlapped_load_refs[group_hash] = load_refs
 
+            # Register in wait_any tracking structures
+            self._group_pending_count[group_hash] = len(load_refs)
+            self._group_meta[group_hash] = (key, memory_obj)
+            for _tier, sub_hash in load_refs:
+                self._sub_to_group[sub_hash] = group_hash
+
             results.append((group_hash, key, memory_obj))
 
         return results
@@ -1532,6 +1549,94 @@ class KVStreamDiskBackend(StorageBackendInterface):
             memory_obj.metadata.cached_positions = (
                 disk_meta.cached_positions
             )
+
+    def _process_sub_completions(
+        self, sub_hashes: list[str]
+    ) -> list[tuple[str, CacheEngineKey, MemoryObj]]:
+        """Accumulate sub-hash completions and return fully-ready chunks.
+
+        For each completed sub-hash, decrements the pending count of
+        its parent group.  When a group reaches zero, its metadata is
+        finalised and the group is yielded as ready.
+
+        Args:
+            sub_hashes: Sub-hashes that just completed.
+
+        Returns:
+            List of ``(group_hash, key, memory_obj)`` for chunks whose
+            I/O across all tiers is now complete.
+        """
+        ready: list[tuple[str, CacheEngineKey, MemoryObj]] = []
+        for sub_hash in sub_hashes:
+            group_hash = self._sub_to_group.pop(sub_hash, None)
+            if group_hash is None:
+                continue
+            remaining = self._group_pending_count[group_hash] - 1
+            if remaining > 0:
+                self._group_pending_count[group_hash] = remaining
+                continue
+            # All sub-hashes for this group are done
+            del self._group_pending_count[group_hash]
+            key, memory_obj = self._group_meta.pop(group_hash)
+            self._overlapped_load_refs.pop(group_hash, None)
+            # Recover cached_positions metadata
+            disk_meta = self.dict.get(key, None)
+            if disk_meta is not None:
+                memory_obj.metadata.cached_positions = (
+                    disk_meta.cached_positions
+                )
+            ready.append((group_hash, key, memory_obj))
+        return ready
+
+    @_lmcache_nvtx_annotate
+    def wait_any_load(
+        self,
+    ) -> list[tuple[str, CacheEngineKey, MemoryObj]]:
+        """Block until at least one chunk has all tier I/O complete.
+
+        Uses completion-driven reaping: drains all tier engines
+        non-blockingly, then blocks on one engine if nothing is
+        ready yet.  Returns **all** chunks that are fully complete
+        at the time of return.
+
+        Returns:
+            List of ``(group_hash, key, memory_obj)`` for every
+            chunk whose reads across all tiers finished.
+        """
+        ready: list[
+            tuple[str, CacheEngineKey, MemoryObj]
+        ] = []
+        io_queue_read = self.kvstream_core.IOQueue.READ
+
+        while not ready:
+            # Phase 1: non-blocking drain from every tier engine
+            for tier in self._tiers:
+                newly_done = tier.engine.drain_completed_queue(
+                    io_queue_read
+                )
+                if newly_done:
+                    ready.extend(
+                        self._process_sub_completions(newly_done)
+                    )
+
+            if ready:
+                break
+
+            # Phase 2: nothing fully ready — block until the
+            # first tier engine delivers at least one completion.
+            torch.cuda.nvtx.range_push("kvs_wait_any")
+            completed = self._tiers[0].engine.wait_any_completed(
+                io_queue_read
+            )
+            torch.cuda.nvtx.range_pop()
+            ready.extend(
+                self._process_sub_completions(completed)
+            )
+            # If still not ready (sub-hashes from one tier done but
+            # the other tier's sub-hashes still pending), loop back
+            # to drain all tiers again.
+
+        return ready
 
     def _sync_batch_load(
         self,

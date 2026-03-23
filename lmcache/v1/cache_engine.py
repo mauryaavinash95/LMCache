@@ -1790,48 +1790,67 @@ class LMCacheEngine:
                 pending = kvstream_backend.submit_batch_load(keys)
                 t_disk_submit = time.perf_counter() - t0
 
-                # Interleave completions with GPU transfers.
+                # Build lookup and count valid pending entries.
+                # group_hash -> (key, start, end) for GPU transfer.
+                group_to_block: dict[str, tuple] = {}
+                total_pending = 0
                 first_completion_recorded = False
+
+                for (key, start, end), entry in zip(
+                    blocks, pending, strict=False
+                ):
+                    if entry is None:
+                        logger.warning(
+                            "KVStream overlapped: key missing "
+                            "from disk cache during load"
+                        )
+                        if (
+                            last_failed_block_start is None
+                            or last_failed_block_start < start
+                        ):
+                            last_failed_block_start = start
+                        break
+                    io_hash, _, _memory_obj = entry
+                    group_to_block[io_hash] = (key, start, end)
+                    total_pending += 1
+
+                # Completion-driven loop: process chunks in
+                # whatever order their I/O finishes.
+                completed_count = 0
                 with torch.cuda.stream(self.gpu_connector.load_stream):
-                    for (key, start, end), entry in zip(
-                        blocks, pending, strict=False
-                    ):
-                        if entry is None:
-                            logger.warning(
-                                "KVStream overlapped: key missing "
-                                "from disk cache during load"
+                    while completed_count < total_pending:
+                        ready = kvstream_backend.wait_any_load()
+                        for (
+                            group_hash,
+                            rkey,
+                            memory_obj,
+                        ) in ready:
+                            t_now = time.perf_counter()
+                            if not first_completion_recorded:
+                                t_disk_first_completion = (
+                                    t_now - t0
+                                )
+                                first_completion_recorded = True
+                            t_disk_last_completion = t_now - t0
+
+                            _, start, end = group_to_block[
+                                group_hash
+                            ]
+
+                            # Queue GPU transfer immediately.
+                            self.gpu_connector.to_gpu(
+                                memory_obj, start, end, **kwargs
                             )
-                            if (
-                                last_failed_block_start is None
-                                or last_failed_block_start < start
-                            ):
-                                last_failed_block_start = start
-                            break
 
-                        io_hash, _, memory_obj = entry
-                        kvstream_backend.wait_one_load(
-                            io_hash, key, memory_obj
-                        )
-
-                        t_now = time.perf_counter()
-                        if not first_completion_recorded:
-                            t_disk_first_completion = t_now - t0
-                            first_completion_recorded = True
-                        t_disk_last_completion = t_now - t0
-
-                        # Queue GPU transfer immediately on load_stream.
-                        self.gpu_connector.to_gpu(
-                            memory_obj, start, end, **kwargs
-                        )
-
-                        reordered_chunks.append(
-                            (key, memory_obj, start, end)
-                        )
-                        chunk_size = memory_obj.get_size()
-                        tot_kv_size += chunk_size
-                        disk_bytes += chunk_size
-                        disk_chunks += 1
-                        ret_mask[start:end] = True
+                            reordered_chunks.append(
+                                (rkey, memory_obj, start, end)
+                            )
+                            chunk_size = memory_obj.get_size()
+                            tot_kv_size += chunk_size
+                            disk_bytes += chunk_size
+                            disk_chunks += 1
+                            ret_mask[start:end] = True
+                            completed_count += 1
 
                 t_sync_start = time.perf_counter()
                 self.gpu_connector.load_stream.synchronize()
