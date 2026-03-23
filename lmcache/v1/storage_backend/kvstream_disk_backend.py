@@ -519,12 +519,21 @@ class KVStreamDiskBackend(StorageBackendInterface):
         # sub_hash -> group_hash: maps individual per-tier I/O hashes
         # back to the chunk-level group hash.
         self._sub_to_group: dict[str, str] = {}
+        # sub_hash -> tier index: identifies which tier engine owns
+        # a sub-hash so we can decrement the right pending counter.
+        self._sub_to_tier_idx: dict[str, int] = {}
         # group_hash -> count of sub-hashes still pending.
         self._group_pending_count: dict[str, int] = {}
         # group_hash -> (key, memory_obj) for chunks awaiting completion.
         self._group_meta: dict[
             str, tuple[CacheEngineKey, MemoryObj]
         ] = {}
+        # Per-tier count of sub-hashes still pending across all
+        # in-flight chunks.  Used to select which tier engine to
+        # block on in wait_any_load().
+        self._tier_pending_subs: list[int] = [
+            0 for _ in range(len(self._tiers))
+        ]
 
         # -- Batched message sender (controller ADMIT/EVICT msgs) --------
         self.batched_msg_sender: Optional[BatchedMessageSender] = None
@@ -1514,6 +1523,9 @@ class KVStreamDiskBackend(StorageBackendInterface):
             self._group_meta[group_hash] = (key, memory_obj)
             for _tier, sub_hash in load_refs:
                 self._sub_to_group[sub_hash] = group_hash
+                tier_idx = self._tiers.index(_tier)
+                self._sub_to_tier_idx[sub_hash] = tier_idx
+                self._tier_pending_subs[tier_idx] += 1
 
             results.append((group_hash, key, memory_obj))
 
@@ -1568,6 +1580,11 @@ class KVStreamDiskBackend(StorageBackendInterface):
         """
         ready: list[tuple[str, CacheEngineKey, MemoryObj]] = []
         for sub_hash in sub_hashes:
+            # Decrement per-tier pending counter
+            tier_idx = self._sub_to_tier_idx.pop(sub_hash, None)
+            if tier_idx is not None:
+                self._tier_pending_subs[tier_idx] -= 1
+
             group_hash = self._sub_to_group.pop(sub_hash, None)
             if group_hash is None:
                 continue
@@ -1622,16 +1639,34 @@ class KVStreamDiskBackend(StorageBackendInterface):
             if ready:
                 break
 
-            # Phase 2: nothing fully ready — block until the
-            # first tier engine delivers at least one completion.
-            torch.cuda.nvtx.range_push("kvs_wait_any")
-            completed = self._tiers[0].engine.wait_any_completed(
-                io_queue_read
-            )
-            torch.cuda.nvtx.range_pop()
-            ready.extend(
-                self._process_sub_completions(completed)
-            )
+            # Phase 2: nothing fully ready — block on a tier
+            # engine that still has pending sub-hashes.  Blocking
+            # on a tier with zero pending would deadlock.
+            blocked = False
+            for ti, tier in enumerate(self._tiers):
+                if self._tier_pending_subs[ti] > 0:
+                    torch.cuda.nvtx.range_push(
+                        f"kvs_wait_any_t{ti}"
+                    )
+                    completed = tier.engine.wait_any_completed(
+                        io_queue_read
+                    )
+                    torch.cuda.nvtx.range_pop()
+                    ready.extend(
+                        self._process_sub_completions(completed)
+                    )
+                    blocked = True
+                    break
+
+            if not blocked:
+                # Should not happen: no tier has pending subs but
+                # we still have pending groups.  Defensive break.
+                logger.error(
+                    "wait_any_load: no tier has pending subs but "
+                    "%d groups remain — breaking to avoid hang",
+                    len(self._group_pending_count),
+                )
+                break
             # If still not ready (sub-hashes from one tier done but
             # the other tier's sub-hashes still pending), loop back
             # to drain all tiers again.
