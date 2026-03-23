@@ -1527,6 +1527,14 @@ class KVStreamDiskBackend(StorageBackendInterface):
                 self._sub_to_tier_idx[sub_hash] = tier_idx
                 self._tier_pending_subs[tier_idx] += 1
 
+            # Promote into CPU hot_cache immediately so the
+            # LRU insertion order matches the deterministic key
+            # order.  ref_count goes 1→2, making the entry
+            # non-evictable while the io_uring read is in-flight.
+            # The caller's later ref_count_down() will drop it
+            # to 1, leaving it evictable in hot_cache.
+            self.local_cpu_backend.submit_put_task(key, memory_obj)
+
             results.append((group_hash, key, memory_obj))
 
         return results

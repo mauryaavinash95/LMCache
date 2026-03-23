@@ -1883,13 +1883,6 @@ class LMCacheEngine:
                                 memory_obj, start, end, **kwargs
                             )
 
-                            # Promote disk-loaded chunk into CPU
-                            # hot_cache so future lookups find it
-                            # in CPU rather than going to disk.
-                            kvstream_backend.local_cpu_backend.submit_put_task(
-                                rkey, memory_obj
-                            )
-
                             reordered_chunks.append(
                                 (rkey, memory_obj, start, end)
                             )
@@ -2215,13 +2208,6 @@ class LMCacheEngine:
 
                     self.gpu_connector.to_gpu(
                         memory_obj, start, end, **state.kwargs
-                    )
-
-                    # Promote disk-loaded chunk into CPU
-                    # hot_cache so future lookups find it
-                    # in CPU rather than going to disk.
-                    kvstream_backend.local_cpu_backend.submit_put_task(
-                        rkey, memory_obj
                     )
 
                     state.reordered_chunks.append(
