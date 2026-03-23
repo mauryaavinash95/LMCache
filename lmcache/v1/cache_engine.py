@@ -2,6 +2,7 @@
 # Standard
 from collections import defaultdict
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -70,6 +71,46 @@ logger = init_logger(__name__)
 ProcessedChunk = Tuple[CacheEngineKey, MemoryObj, int, int]
 # (list of processed chunks, total kv size)
 ProcessTokensInternalResult = Tuple[List[ProcessedChunk], int]
+
+
+@dataclass
+class OverlappedRetrieveState:
+    """Per-request state for cross-request overlapped retrieve.
+
+    Holds the intermediate data between the prepare, CPU-process,
+    disk-drain, and finalise phases of the split overlapped retrieve
+    pipeline.  Created by ``prepare_overlapped_retrieve`` and consumed
+    by the subsequent phase methods.
+    """
+
+    req_id: str
+    kwargs: Dict[str, Any]
+    ret_mask: torch.Tensor
+    block_mapping: Dict[str, List[Tuple[CacheEngineKey, int, int]]]
+
+    # Disk phase — populated by prepare, consumed by drain
+    group_to_block: Dict[str, Tuple[CacheEngineKey, int, int]] = field(
+        default_factory=dict
+    )
+    total_disk_pending: int = 0
+
+    # Results — accumulated across phases
+    reordered_chunks: List[ProcessedChunk] = field(default_factory=list)
+    tot_kv_size: int = 0
+    last_failed_block_start: Optional[int] = None
+
+    # Profiling accumulators
+    t0: float = 0.0
+    cpu_chunks: int = 0
+    cpu_bytes: int = 0
+    t_cpu_total: float = 0.0
+    disk_chunks: int = 0
+    disk_bytes: int = 0
+    t_disk_submit: float = 0.0
+    t_disk_first_completion: float = 0.0
+    t_disk_last_completion: float = 0.0
+    t_gpu_sync: float = 0.0
+    first_completion_recorded: bool = False
 
 
 class CacheEngineEndSignal:
@@ -1963,6 +2004,335 @@ class LMCacheEngine:
             )
 
         return reordered_chunks, tot_kv_size
+
+    # ------------------------------------------------------------------ #
+    #  Split overlapped retrieve (cross-request disk/CPU overlap)         #
+    # ------------------------------------------------------------------ #
+
+    @torch.inference_mode()
+    def prepare_overlapped_retrieve(
+        self,
+        tokens: Union[torch.Tensor, list],
+        mask: Optional[torch.Tensor],
+        ret_mask: torch.Tensor,
+        kvstream_backend: Any,
+        **kwargs: Any,
+    ) -> OverlappedRetrieveState:
+        """Phase 1: Compute block mapping and submit disk reads.
+
+        Determines which chunks reside on CPU vs disk, then submits
+        all disk reads via io_uring (non-blocking).  Returns an
+        ``OverlappedRetrieveState`` to be passed to subsequent phases.
+
+        Args:
+            tokens: Input tokens for this request.
+            mask: Boolean mask for valid token positions.
+            ret_mask: Output mask updated with cache hit positions.
+            kvstream_backend: The ``KVStreamDiskBackend`` instance.
+            **kwargs: Additional arguments (kvcaches, slot_mapping, etc.).
+
+        Returns:
+            ``OverlappedRetrieveState`` with block_mapping populated
+            and disk reads submitted.
+        """
+        from lmcache.v1.storage_backend.kvstream_disk_backend import (
+            KVStreamDiskBackend,
+        )
+
+        assert self.storage_manager is not None
+
+        request_configs = kwargs.get("request_configs")
+        if request_configs is not None and len(request_configs) != 0:
+            assert isinstance(request_configs, dict)
+
+        # Compute chunk keys and block mapping
+        chunk_infos: list = []
+        for start, end, key in self.token_database.process_tokens(
+            tokens=tokens,
+            mask=mask,
+            request_configs=request_configs,
+        ):
+            assert isinstance(key, CacheEngineKey)
+            chunk_infos.append((key, start, end))
+
+        req_id = kwargs.get("req_id", "")
+        if (
+            req_id
+            and req_id in self.lookup_pins
+            and len(self.lookup_pins[req_id]) == 1
+        ):
+            location = next(iter(self.lookup_pins[req_id].keys()))
+            block_mapping: Dict[
+                str, List[Tuple[CacheEngineKey, int, int]]
+            ] = {location: chunk_infos}
+        else:
+            block_mapping = self.storage_manager.get_block_mapping(
+                chunk_infos
+            )
+
+        state = OverlappedRetrieveState(
+            req_id=req_id,
+            kwargs=kwargs,
+            ret_mask=ret_mask,
+            block_mapping=block_mapping,
+            t0=time.perf_counter(),
+        )
+
+        # Submit disk reads (non-blocking)
+        disk_blocks = block_mapping.get("KVStreamDiskBackend", [])
+        if disk_blocks and isinstance(
+            kvstream_backend, KVStreamDiskBackend
+        ):
+            disk_keys = [key for key, _, _ in disk_blocks]
+            t_sub_start = time.perf_counter()
+            pending = kvstream_backend.submit_batch_load(disk_keys)
+            state.t_disk_submit = (
+                time.perf_counter() - t_sub_start
+            )
+
+            for (key, start, end), entry in zip(
+                disk_blocks, pending, strict=False
+            ):
+                if entry is None:
+                    logger.warning(
+                        "KVStream overlapped: key missing "
+                        "from disk cache during load"
+                    )
+                    if (
+                        state.last_failed_block_start is None
+                        or state.last_failed_block_start < start
+                    ):
+                        state.last_failed_block_start = start
+                    break
+                io_hash, _, _memory_obj = entry
+                state.group_to_block[io_hash] = (key, start, end)
+                state.total_disk_pending += 1
+
+        return state
+
+    @torch.inference_mode()
+    def process_cpu_blocks(
+        self,
+        state: OverlappedRetrieveState,
+    ) -> None:
+        """Phase 2: Transfer CPU-resident chunks to GPU.
+
+        Processes all non-KVStreamDiskBackend blocks in ``state``
+        via ``batched_get`` + ``to_gpu`` on the ``load_stream``.
+        Disk I/O (submitted in phase 1) proceeds in the background.
+
+        Args:
+            state: The retrieve state from ``prepare_overlapped_retrieve``.
+        """
+        assert self.gpu_connector is not None
+
+        for location, blocks in state.block_mapping.items():
+            if location == "KVStreamDiskBackend":
+                continue
+
+            t0_cpu = time.perf_counter()
+            keys = [key for key, _, _ in blocks]
+            assert self.storage_manager is not None
+            memory_objs = self.storage_manager.batched_get(
+                keys=keys, location=location
+            )
+
+            with torch.cuda.stream(self.gpu_connector.load_stream):
+                for (key, start, end), memory_obj in zip(
+                    blocks, memory_objs, strict=False
+                ):
+                    if memory_obj is None:
+                        logger.warning(
+                            "The cache block is in the storage, "
+                            "but it can't be retrieved"
+                        )
+                        if (
+                            state.last_failed_block_start is None
+                            or state.last_failed_block_start < start
+                        ):
+                            state.last_failed_block_start = start
+                        break
+
+                    self.gpu_connector.to_gpu(
+                        memory_obj, start, end, **state.kwargs
+                    )
+
+                    state.reordered_chunks.append(
+                        (key, memory_obj, start, end)
+                    )
+                    chunk_size = memory_obj.get_size()
+                    state.tot_kv_size += chunk_size
+                    state.cpu_bytes += chunk_size
+                    state.cpu_chunks += 1
+                    state.ret_mask[start:end] = True
+
+            state.t_cpu_total += time.perf_counter() - t0_cpu
+
+    @torch.inference_mode()
+    def drain_disk_blocks(
+        self,
+        state: OverlappedRetrieveState,
+        kvstream_backend: Any,
+    ) -> None:
+        """Phase 3: Drain completed disk reads and transfer to GPU.
+
+        Blocks until all disk chunks for this request complete,
+        issuing ``to_gpu`` on the ``load_stream`` as each chunk
+        becomes ready (completion-driven via ``wait_any_load``).
+
+        Args:
+            state: The retrieve state from earlier phases.
+            kvstream_backend: The ``KVStreamDiskBackend`` instance.
+        """
+        if state.total_disk_pending == 0:
+            return
+
+        assert self.gpu_connector is not None
+        completed_count = 0
+
+        with torch.cuda.stream(self.gpu_connector.load_stream):
+            while completed_count < state.total_disk_pending:
+                ready = kvstream_backend.wait_any_load()
+                for group_hash, rkey, memory_obj in ready:
+                    t_now = time.perf_counter()
+                    if not state.first_completion_recorded:
+                        state.t_disk_first_completion = (
+                            t_now - state.t0
+                        )
+                        state.first_completion_recorded = True
+                    state.t_disk_last_completion = t_now - state.t0
+
+                    _, start, end = state.group_to_block[
+                        group_hash
+                    ]
+
+                    self.gpu_connector.to_gpu(
+                        memory_obj, start, end, **state.kwargs
+                    )
+
+                    state.reordered_chunks.append(
+                        (rkey, memory_obj, start, end)
+                    )
+                    chunk_size = memory_obj.get_size()
+                    state.tot_kv_size += chunk_size
+                    state.disk_bytes += chunk_size
+                    state.disk_chunks += 1
+                    state.ret_mask[start:end] = True
+                    completed_count += 1
+
+    @torch.inference_mode()
+    def finalize_overlapped_retrieve(
+        self,
+        state: OverlappedRetrieveState,
+        kvstream_backend: Any,
+        num_required_tokens: int,
+        skip_sync: bool = False,
+    ) -> torch.Tensor:
+        """Phase 4: Handle failures, clean up, log.
+
+        Optionally synchronizes the ``load_stream``, then processes
+        failures, releases memory references, and emits profiling
+        logs.
+
+        Args:
+            state: The retrieve state from earlier phases.
+            kvstream_backend: The ``KVStreamDiskBackend`` instance.
+            num_required_tokens: Number of tokens the caller expected
+                to retrieve (for logging).
+            skip_sync: If ``True``, the caller has already synced
+                the ``load_stream``; skip the redundant sync.
+
+        Returns:
+            The ``ret_mask`` indicating which tokens were retrieved.
+        """
+        from lmcache.v1.storage_backend.kvstream_disk_backend import (
+            KVStreamDiskBackend,
+        )
+
+        assert self.gpu_connector is not None
+
+        # Synchronize GPU load stream (unless caller already did)
+        if not skip_sync:
+            t_sync_start = time.perf_counter()
+            self.gpu_connector.load_stream.synchronize()
+            state.t_gpu_sync = time.perf_counter() - t_sync_start
+
+        # Handle failures
+        if state.last_failed_block_start is not None:
+            state.ret_mask[state.last_failed_block_start:] = False
+            state.reordered_chunks = [
+                (key, memory_obj, start, end)
+                for key, memory_obj, start, end
+                in state.reordered_chunks
+                if end < state.last_failed_block_start
+            ]
+
+        # Profiling summary
+        t_retrieve_total = time.perf_counter() - state.t0
+        rank = self.metadata.worker_id
+        total_chunks = state.cpu_chunks + state.disk_chunks
+        total_bytes_mb = (
+            (state.cpu_bytes + state.disk_bytes) / 1e6
+        )
+
+        tier_stats_list: list = []
+        if (
+            state.disk_chunks > 0
+            and isinstance(kvstream_backend, KVStreamDiskBackend)
+        ):
+            tier_stats_list = (
+                kvstream_backend.get_tier_read_stats()
+            )
+
+        if total_chunks > 0:
+            parts = [
+                f"rank={rank}",
+                f"chunks={total_chunks}",
+                f"total={t_retrieve_total * 1e3:.1f}ms",
+                f"data={total_bytes_mb:.1f}MB",
+            ]
+            if state.cpu_chunks > 0:
+                parts.append(
+                    f"cpu={state.cpu_chunks}chunks/"
+                    f"{state.cpu_bytes / 1e6:.1f}MB/"
+                    f"{state.t_cpu_total * 1e3:.1f}ms"
+                )
+            if state.disk_chunks > 0:
+                disk_bw = (
+                    state.disk_bytes
+                    / state.t_disk_last_completion
+                    / 1e6
+                    if state.t_disk_last_completion > 0
+                    else 0.0
+                )
+                parts.append(
+                    f"disk={state.disk_chunks}chunks/"
+                    f"{state.disk_bytes / 1e6:.1f}MB/"
+                    f"submit={state.t_disk_submit * 1e3:.2f}ms/"
+                    f"first={state.t_disk_first_completion * 1e3:.1f}ms/"
+                    f"last={state.t_disk_last_completion * 1e3:.1f}ms/"
+                    f"bw={disk_bw:.0f}MB/s/"
+                    f"gpu_sync={state.t_gpu_sync * 1e3:.2f}ms"
+                )
+                for ts in tier_stats_list:
+                    parts.append(
+                        f"t{ts['tier']}_rd="
+                        f"{ts['read_bytes'] / 1e6:.1f}MB/"
+                        f"{ts['read_bw_mb_s']}MB_s/"
+                        f"{ts['read_elapsed_ms']}ms"
+                    )
+            logger.info(
+                "overlapped_retrieve: %s", " | ".join(parts)
+            )
+
+        # Release memory references
+        for key, memory_obj, _, _ in state.reordered_chunks:
+            if self.remove_after_retrieve and not self._is_passive():
+                assert self.storage_manager is not None
+                self.storage_manager.remove(key)
+            memory_obj.ref_count_down()
+
+        return state.ret_mask
 
     def _broadcast_or_receive_memory_objs(
         self,

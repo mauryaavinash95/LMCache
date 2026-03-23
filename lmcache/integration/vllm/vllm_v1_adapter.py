@@ -37,7 +37,7 @@ from lmcache.integration.vllm.utils import (
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
-from lmcache.v1.cache_engine import LMCacheEngine
+from lmcache.v1.cache_engine import LMCacheEngine, OverlappedRetrieveState
 from lmcache.v1.hash_tracer import RequestHashTracer
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
@@ -579,6 +579,13 @@ class LMCacheConnectorV1Impl:
         # step's reads complete.
         self._kvstream_backend: Optional["KVStreamDiskBackend"] = None  # noqa: F821
         self._kvstream_deferred_checked: bool = False
+        # Cross-request overlapped retrieve: submit disk reads for ALL
+        # requests before processing any CPU→GPU transfers.
+        self._kvstream_overlapped_retrieve: bool = bool(
+            self._extra_config.get(
+                "kvstream_overlapped_retrieve", False
+            )
+        )
         # Per-tier stats from the previous step's reads, included in the
         # next step's JSON log line.  Populated at the end of
         # start_load_kv, consumed by _emit_step_log.
@@ -801,6 +808,35 @@ class LMCacheConnectorV1Impl:
                 continue
             last_idx = idx
 
+        # -------------------------------------------------------------- #
+        # Cross-request overlapped retrieve (KVStream only)               #
+        # Submit ALL disk reads first, then CPU→GPU, then drain disk.     #
+        # -------------------------------------------------------------- #
+        # Lazy-init the KVStream backend reference on the first call.
+        if (
+            self._kvstream_overlapped_retrieve
+            and not self._kvstream_deferred_checked
+        ):
+            self._flush_deferred_writes_if_enabled()
+        if (
+            self._kvstream_overlapped_retrieve
+            and not self.use_layerwise
+            and self._kvstream_backend is not None
+        ):
+            self._start_load_kv_overlapped(
+                metadata, kvcaches,
+            )
+            self._flush_deferred_writes_if_enabled()
+
+            if self._kvstream_backend is not None:
+                self._kvstream_last_tier_stats = (
+                    self._kvstream_backend.get_tier_stats_and_reset()
+                )
+            return
+
+        # -------------------------------------------------------------- #
+        # Default per-request retrieve path                               #
+        # -------------------------------------------------------------- #
         for idx, request in enumerate(metadata.requests):
             # Update metrics for all requests that have a load_spec
             if request.load_spec is not None:
@@ -934,6 +970,194 @@ class LMCacheConnectorV1Impl:
             self._kvstream_last_tier_stats = (
                 self._kvstream_backend.get_tier_stats_and_reset()
             )
+
+    @_lmcache_nvtx_annotate
+    def _start_load_kv_overlapped(
+        self,
+        metadata: "LMCacheConnectorMetadata",
+        kvcaches: list,
+    ) -> None:
+        """Cross-request overlapped retrieve for KVStream.
+
+        Submits ALL disk reads for all requests before processing
+        any CPU→GPU transfers, allowing disk I/O to overlap with
+        CPU-tier H2D copies.
+
+        Phase 1: For each request, compute block mapping, set up
+                 hash tracing, submit disk reads (non-blocking).
+        Phase 2: For each request, transfer CPU-resident chunks
+                 to GPU (disk I/O proceeds in background).
+        Phase 3: For each request, drain disk completions and
+                 transfer to GPU as they arrive.
+        Phase 4: Synchronize GPU, check results, clean up.
+
+        Args:
+            metadata: Connector metadata with per-request info.
+            kvcaches: List of KV cache tensors.
+        """
+        assert self.lmcache_engine is not None
+        kvstream_be = self._kvstream_backend
+        assert kvstream_be is not None
+
+        # Collect per-request preparation state
+        request_states: list[
+            tuple[Any, OverlappedRetrieveState, int]
+        ] = []
+
+        # ---- Phase 1: prepare + submit disk reads for ALL requests ----
+        for request in metadata.requests:
+            if request.load_spec is not None:
+                self._stats_monitor.update_interval_vllm_hit_tokens(
+                    request.load_spec.vllm_cached_tokens
+                )
+                self._stats_monitor.update_interval_prompt_tokens(
+                    len(request.token_ids)
+                )
+
+            if (
+                request.load_spec is None
+                or not request.load_spec.can_load
+            ):
+                continue
+
+            tokens = request.token_ids
+            slot_mapping = request.slot_mapping.to(self.device)
+            assert len(tokens) == len(slot_mapping)
+
+            token_mask = torch.ones(len(tokens), dtype=torch.bool)
+            masked_token_count = (
+                request.load_spec.vllm_cached_tokens
+                // self._lmcache_chunk_size
+                * self._lmcache_chunk_size
+            )
+            token_mask[:masked_token_count] = False
+
+            # Hash tracing
+            _tracer = RequestHashTracer(
+                req_id=request.req_id,
+                chunk_size=self._lmcache_chunk_size,
+            )
+            _all_keys: list = [
+                key
+                for _, _, key in
+                self.lmcache_engine.token_database.process_tokens(
+                    tokens=tokens,
+                    request_configs=request.request_configs,
+                )
+            ]
+            _all_hashes = [k.chunk_hash for k in _all_keys]
+            _tracer.set_all_hashes(_all_hashes, len(tokens))
+            _tracer.set_vllm_gpu_prefix(
+                request.load_spec.vllm_cached_tokens,
+            )
+            _sm = self.lmcache_engine.storage_manager
+            if _sm is not None:
+                _tier_presence = {}
+                for _key in _all_keys:
+                    _tiers = []
+                    for _bn, _be in _sm.get_active_storage_backends():
+                        if _be.contains(_key, pin=False):
+                            _tiers.append(_bn)
+                    if _tiers:
+                        _tier_presence[_key.chunk_hash] = _tiers
+                _tracer.set_tier_presence(_tier_presence)
+            self.lmcache_engine.hash_tracers[
+                request.req_id
+            ] = _tracer
+
+            lmcache_cached_tokens = (
+                request.load_spec.lmcache_cached_tokens
+            )
+            ret_mask = torch.zeros(
+                len(tokens[:lmcache_cached_tokens]),
+                dtype=torch.bool,
+                device="cpu",
+            )
+
+            state = self.lmcache_engine.prepare_overlapped_retrieve(
+                tokens[:lmcache_cached_tokens],
+                token_mask[:lmcache_cached_tokens],
+                ret_mask,
+                kvstream_be,
+                kvcaches=kvcaches,
+                slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                request_configs=request.request_configs,
+                req_id=request.req_id,
+            )
+
+            num_expected = (
+                lmcache_cached_tokens
+                - request.load_spec.vllm_cached_tokens
+            )
+            request_states.append(
+                (request, state, num_expected)
+            )
+
+        if not request_states:
+            return
+
+        # ---- Phase 2: process CPU blocks for ALL requests ----
+        for _req, state, _nexp in request_states:
+            self.lmcache_engine.process_cpu_blocks(state)
+
+        # ---- Phase 3: drain disk completions for ALL requests ----
+        for _req, state, _nexp in request_states:
+            self.lmcache_engine.drain_disk_blocks(
+                state, kvstream_be
+            )
+
+        # Synchronize load_stream once for ALL requests before
+        # finalize (avoids redundant per-request syncs).
+        assert self.lmcache_engine.gpu_connector is not None
+        self.lmcache_engine.gpu_connector.load_stream.synchronize()
+
+        # ---- Phase 4: finalize ALL requests ----
+        for request, state, num_expected in request_states:
+            lmcache_cached_tokens = (
+                request.load_spec.lmcache_cached_tokens
+            )
+            ret_mask = (
+                self.lmcache_engine.finalize_overlapped_retrieve(
+                    state,
+                    kvstream_be,
+                    num_expected,
+                    skip_sync=True,
+                )
+            )
+
+            num_retrieved = ret_mask.sum().item()
+            if num_retrieved < num_expected:
+                logger.error(
+                    "Request %s "
+                    "The number of retrieved tokens is less "
+                    "than expected! This should not happen!",
+                    request.req_id,
+                )
+                logger.error(
+                    "Num retrieved tokens: %d, "
+                    "num expected tokens: %d",
+                    num_retrieved,
+                    num_expected,
+                )
+                token_mask = torch.ones(
+                    len(request.token_ids), dtype=torch.bool
+                )
+                masked_count = (
+                    request.load_spec.vllm_cached_tokens
+                    // self._lmcache_chunk_size
+                    * self._lmcache_chunk_size
+                )
+                token_mask[:masked_count] = False
+                slot_mapping = request.slot_mapping.to(
+                    self.device
+                )
+                missing_blocks = self.record_failed_blocks(
+                    request.req_id,
+                    token_mask[:lmcache_cached_tokens],
+                    ret_mask,
+                    slot_mapping[:lmcache_cached_tokens],
+                )
+                self._invalid_block_ids.update(missing_blocks)
 
     @_lmcache_nvtx_annotate
     def _flush_deferred_writes_if_enabled(self) -> None:
