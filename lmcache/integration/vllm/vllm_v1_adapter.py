@@ -982,10 +982,14 @@ class LMCacheConnectorV1Impl:
         any CPU→GPU transfers, allowing disk I/O to overlap with
         CPU-tier H2D copies.
 
-        Phase 1: For each request, compute block mapping, set up
-                 hash tracing, submit disk reads (non-blocking).
+        Phase 0: For each request, compute hashes, set up hash
+                 tracing, and pin CPU-resident chunks to prevent
+                 cross-request thrashing during Phase 1.
+        Phase 1: For each request, compute block mapping, submit
+                 disk reads (non-blocking).
         Phase 2: For each request, transfer CPU-resident chunks
                  to GPU (disk I/O proceeds in background).
+                 Unpin CPU chunks after all CPU transfers complete.
         Phase 3: For each request, drain disk completions and
                  transfer to GPU as they arrive.
         Phase 4: Synchronize GPU, check results, clean up.
@@ -1003,7 +1007,25 @@ class LMCacheConnectorV1Impl:
             tuple[Any, OverlappedRetrieveState, int]
         ] = []
 
-        # ---- Phase 1: prepare + submit disk reads for ALL requests ----
+        # Pre-computed per-request data needed by Phase 1.
+        # Each entry: (request, tokens, slot_mapping, token_mask,
+        #              lmcache_cached_tokens, num_expected)
+        request_prep: list[tuple] = []
+
+        # ---- Phase 0: hash tracing, pin CPU-resident chunks ----
+        # Pin every request's CPU-resident chunks BEFORE any
+        # submit_batch_load runs.  Without this, r1's disk-buffer
+        # allocation can evict r2's CPU chunks from the pinned
+        # memory pool, forcing r2 to re-read them from disk
+        # (cross-request thrashing).
+        _sm = self.lmcache_engine.storage_manager
+        cpu_backend = (
+            _sm.storage_backends.get("LocalCPUBackend")
+            if _sm is not None
+            else None
+        )
+        pinned_cpu_keys: list = []
+
         for request in metadata.requests:
             if request.load_spec is not None:
                 self._stats_monitor.update_interval_vllm_hit_tokens(
@@ -1049,7 +1071,6 @@ class LMCacheConnectorV1Impl:
             _tracer.set_vllm_gpu_prefix(
                 request.load_spec.vllm_cached_tokens,
             )
-            _sm = self.lmcache_engine.storage_manager
             if _sm is not None:
                 _tier_presence = {}
                 for _key in _all_keys:
@@ -1067,6 +1088,36 @@ class LMCacheConnectorV1Impl:
             lmcache_cached_tokens = (
                 request.load_spec.lmcache_cached_tokens
             )
+
+            # Pin all of this request's keys in CPU backend.
+            # pin() is a no-op for keys not in hot_cache.
+            if cpu_backend is not None:
+                for _key in _all_keys:
+                    if cpu_backend.pin(_key):
+                        pinned_cpu_keys.append(_key)
+
+            num_expected = (
+                lmcache_cached_tokens
+                - request.load_spec.vllm_cached_tokens
+            )
+            request_prep.append((
+                request, tokens, slot_mapping, token_mask,
+                lmcache_cached_tokens, num_expected,
+            ))
+
+        if not request_prep:
+            # Unpin before early return (all pins are no-ops here,
+            # but keep the logic symmetric).
+            if cpu_backend is not None:
+                for _key in pinned_cpu_keys:
+                    cpu_backend.unpin(_key)
+            return
+
+        # ---- Phase 1: submit disk reads for ALL requests ----
+        for (
+            request, tokens, slot_mapping, token_mask,
+            lmcache_cached_tokens, num_expected,
+        ) in request_prep:
             ret_mask = torch.zeros(
                 len(tokens[:lmcache_cached_tokens]),
                 dtype=torch.bool,
@@ -1084,20 +1135,21 @@ class LMCacheConnectorV1Impl:
                 req_id=request.req_id,
             )
 
-            num_expected = (
-                lmcache_cached_tokens
-                - request.load_spec.vllm_cached_tokens
-            )
             request_states.append(
                 (request, state, num_expected)
             )
 
-        if not request_states:
-            return
-
         # ---- Phase 2: process CPU blocks for ALL requests ----
         for _req, state, _nexp in request_states:
             self.lmcache_engine.process_cpu_blocks(state)
+
+        # Unpin CPU-resident chunks now that Phase 2 has
+        # ref_count_up'd them via get_blocking.  They are safe
+        # from eviction (ref_count >= 2) until ref_count_down
+        # runs in Phase 4.
+        if cpu_backend is not None:
+            for _key in pinned_cpu_keys:
+                cpu_backend.unpin(_key)
 
         # ---- Phase 3: drain disk completions GLOBALLY ----
         # wait_any_load() can return chunks from ANY request, so
