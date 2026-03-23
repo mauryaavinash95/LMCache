@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import json
 import os
+import time
 
 # Third Party
 from vllm.config import (
@@ -582,9 +583,7 @@ class LMCacheConnectorV1Impl:
         # Cross-request overlapped retrieve: submit disk reads for ALL
         # requests before processing any CPU→GPU transfers.
         self._kvstream_overlapped_retrieve: bool = bool(
-            self._extra_config.get(
-                "kvstream_overlapped_retrieve", False
-            )
+            config.get_extra_config_value("kvstream_overlapped_retrieve", False)
         )
         # Per-tier stats from the previous step's reads, included in the
         # next step's JSON log line.  Populated at the end of
@@ -1100,16 +1099,61 @@ class LMCacheConnectorV1Impl:
         for _req, state, _nexp in request_states:
             self.lmcache_engine.process_cpu_blocks(state)
 
-        # ---- Phase 3: drain disk completions for ALL requests ----
+        # ---- Phase 3: drain disk completions GLOBALLY ----
+        # wait_any_load() can return chunks from ANY request, so
+        # we drain all pending disk chunks in a single loop and
+        # route each completion to the correct per-request state.
+        assert self.lmcache_engine.gpu_connector is not None
+        gpu_conn = self.lmcache_engine.gpu_connector
+
+        # Build global group_hash -> state lookup
+        group_to_state: dict[str, OverlappedRetrieveState] = {}
+        total_global_pending = 0
         for _req, state, _nexp in request_states:
-            self.lmcache_engine.drain_disk_blocks(
-                state, kvstream_be
-            )
+            for gh in state.group_to_block:
+                group_to_state[gh] = state
+            total_global_pending += state.total_disk_pending
+
+        completed_global = 0
+        if total_global_pending > 0:
+            with torch.cuda.stream(gpu_conn.load_stream):
+                while completed_global < total_global_pending:
+                    ready = kvstream_be.wait_any_load()
+                    for (
+                        group_hash, rkey, memory_obj
+                    ) in ready:
+                        tgt = group_to_state[group_hash]
+                        t_now = time.perf_counter()
+                        if not tgt.first_completion_recorded:
+                            tgt.t_disk_first_completion = (
+                                t_now - tgt.t0
+                            )
+                            tgt.first_completion_recorded = True
+                        tgt.t_disk_last_completion = (
+                            t_now - tgt.t0
+                        )
+
+                        _, start, end = tgt.group_to_block[
+                            group_hash
+                        ]
+                        gpu_conn.to_gpu(
+                            memory_obj, start, end,
+                            **tgt.kwargs,
+                        )
+
+                        tgt.reordered_chunks.append(
+                            (rkey, memory_obj, start, end)
+                        )
+                        chunk_size = memory_obj.get_size()
+                        tgt.tot_kv_size += chunk_size
+                        tgt.disk_bytes += chunk_size
+                        tgt.disk_chunks += 1
+                        tgt.ret_mask[start:end] = True
+                        completed_global += 1
 
         # Synchronize load_stream once for ALL requests before
         # finalize (avoids redundant per-request syncs).
-        assert self.lmcache_engine.gpu_connector is not None
-        self.lmcache_engine.gpu_connector.load_stream.synchronize()
+        gpu_conn.load_stream.synchronize()
 
         # ---- Phase 4: finalize ALL requests ----
         for request, state, num_expected in request_states:
