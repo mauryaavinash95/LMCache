@@ -84,6 +84,8 @@ class _TierConfig:
     max_fds: int
     max_retries: int
     try_odirect: bool
+    locking: str  # "rw" or "none"
+    slab_size_mb: int  # 0 = file-per-chunk, >0 = slab aggregation
 
     @property
     def num_layers(self) -> int:
@@ -360,6 +362,37 @@ class KVStreamDiskBackend(StorageBackendInterface):
         ratios = _parse_ratios(ratios_str)
         num_tiers = len(ratios)
 
+        # Per-tier locking mode: "rw" = wait for writes to complete
+        # before reads start (prevents NVMe read/write contention);
+        # "none" = no synchronisation.  Default is "none" for all tiers.
+        locking_str: str = str(
+            extra.get("kvstream_tier_locking", "none")
+        )
+        locking_modes = [
+            m.strip().lower()
+            for m in locking_str.split(":")
+        ]
+        # Extend to num_tiers if fewer values given (last value repeats)
+        while len(locking_modes) < num_tiers:
+            locking_modes.append(locking_modes[-1])
+        for lm in locking_modes:
+            if lm not in ("rw", "none"):
+                raise ValueError(
+                    f"kvstream_tier_locking: unknown mode '{lm}'. "
+                    "Valid values: 'rw', 'none'"
+                )
+
+        # Per-tier slab aggregation: 0 = file-per-chunk (default),
+        # >0 = slab files of that size in MB.  Colon-separated for
+        # per-tier control, e.g. "0:512" = file-per-chunk on tier 0,
+        # 512 MB slabs on tier 1.
+        slab_str: str = str(
+            extra.get("kvstream_slab_size_mb", "0")
+        )
+        slab_sizes = [int(s.strip()) for s in slab_str.split(":")]
+        while len(slab_sizes) < num_tiers:
+            slab_sizes.append(slab_sizes[-1])
+
         # Determine num_layers from metadata.  metadata may be None in
         # some test/scheduler contexts; fall back to kv_shape if available.
         if metadata is not None:
@@ -401,9 +434,18 @@ class KVStreamDiskBackend(StorageBackendInterface):
                 self._per_layer_bytes,
             )
 
-        # Build tier configs and engines
+        # Build tier configs and engines.
+        # Tiers with zero assigned layers (e.g. from split_ratios "1.0:0.0")
+        # are silently dropped to avoid null-pointer I/O submissions and
+        # leaked inflight groups.
         self._tiers: list[_TierState] = []
         for i in range(num_tiers):
+            if boundaries[i] == boundaries[i + 1]:
+                logger.info(
+                    "KVStream: skipping tier %d (zero layers assigned)", i
+                )
+                continue
+
             tier_path: str
             if i == 0:
                 tier_path = self.path
@@ -422,8 +464,11 @@ class KVStreamDiskBackend(StorageBackendInterface):
                     "Created KVStream tier %d directory: %s", i, tier_path
                 )
 
+            # Re-index surviving tiers sequentially.
+            tier_index = len(self._tiers)
+
             tc = _TierConfig(
-                index=i,
+                index=tier_index,
                 path=tier_path,
                 ratio=ratios[i],
                 layer_start=boundaries[i],
@@ -469,6 +514,8 @@ class KVStreamDiskBackend(StorageBackendInterface):
                         global_try_odirect,
                     )
                 ),
+                locking=locking_modes[i],
+                slab_size_mb=slab_sizes[i],
             )
 
             engine = kvstream_core.KVStream(
@@ -486,8 +533,9 @@ class KVStreamDiskBackend(StorageBackendInterface):
             logger.info(
                 "KVStream tier %d initialized: path=%s, layers=[%d,%d), "
                 "ratio=%.2f, read_chunk_kb=%d, read_qd=%d, write_qd=%d, "
-                "write_chunk_kb=%d, max_fds=%d, try_odirect=%s",
-                i,
+                "write_chunk_kb=%d, max_fds=%d, try_odirect=%s, "
+                "locking=%s, slab_size_mb=%d",
+                tier_index,
                 tc.path,
                 tc.layer_start,
                 tc.layer_end,
@@ -498,6 +546,8 @@ class KVStreamDiskBackend(StorageBackendInterface):
                 tc.write_chunk_size_kb,
                 tc.max_fds,
                 tc.try_odirect,
+                tc.locking,
+                tc.slab_size_mb,
             )
 
         # Convenience: keep a reference to the single engine for
@@ -585,26 +635,35 @@ class KVStreamDiskBackend(StorageBackendInterface):
             logger.info("KVStream deferred writes enabled")
 
         # -- Slab file aggregation ---------------------------------------
-        # If kvstream_slab_size_mb > 0, chunks are packed into large slab
-        # files instead of one file per chunk.  0 = file-per-chunk mode.
-        slab_size_mb: int = int(extra.get("kvstream_slab_size_mb", 512))
-        self._slab_size_limit: int = slab_size_mb * 1024 * 1024
-        if self._slab_size_limit > 0:
+        # Per-tier slab sizes are already parsed into each _TierConfig.
+        # If ANY tier has slab_size_mb > 0, allocate per-tier bump
+        # allocator state (unused entries for file-per-chunk tiers are
+        # harmless and simplify indexing).
+        actual_num_tiers = len(self._tiers)
+        self._any_slab_enabled: bool = any(
+            t.config.slab_size_mb > 0 for t in self._tiers
+        )
+        if self._any_slab_enabled:
             # Per-tier bump allocator: current slab number and write offset
             self._slab_counters: list[int] = [
-                0 for _ in range(num_tiers)
+                0 for _ in range(actual_num_tiers)
             ]
             self._slab_offsets: list[int] = [
-                0 for _ in range(num_tiers)
+                0 for _ in range(actual_num_tiers)
+            ]
+            slab_tiers = [
+                f"tier{t.config.index}={t.config.slab_size_mb}MB"
+                for t in self._tiers
+                if t.config.slab_size_mb > 0
             ]
             logger.info(
-                "KVStream slab aggregation enabled: slab_size_mb=%d",
-                slab_size_mb,
+                "KVStream slab aggregation enabled: %s",
+                ", ".join(slab_tiers),
             )
 
         # -- Consolidated kvstream config log ----------------------------
         logger.info(
-            "KVStream config: kvstream_slab_size_mb=%d, "
+            "KVStream config: kvstream_slab_size_mb=%s, "
             "kvstream_deferred_writes=%s, "
             "kvstream_drain_poll_interval_s=%.3f, "
             "kvstream_read_chunk_size_kb=%d, "
@@ -615,9 +674,10 @@ class KVStreamDiskBackend(StorageBackendInterface):
             "kvstream_max_retries=%d, "
             "kvstream_try_odirect=%s, "
             "kvstream_split_ratios=%s, "
+            "kvstream_tier_locking=%s, "
             "num_tiers=%d, num_layers=%d, "
             "per_layer_bytes=%d, kv_block_bytes=%d",
-            slab_size_mb,
+            slab_str,
             self._deferred_writes_enabled,
             drain_interval,
             global_read_chunk_kb,
@@ -628,7 +688,8 @@ class KVStreamDiskBackend(StorageBackendInterface):
             global_max_retries,
             global_try_odirect,
             ratios_str,
-            num_tiers,
+            locking_str,
+            actual_num_tiers,
             self._num_layers,
             self._per_layer_bytes,
             self._kv_block_bytes,
@@ -711,8 +772,8 @@ class KVStreamDiskBackend(StorageBackendInterface):
         """Allocate space in the current slab file for a tier.
 
         Bump-allocator: appends ``size`` bytes to the current slab.
-        When the slab would exceed ``_slab_size_limit``, a new slab
-        file is started.
+        When the slab would exceed the tier's slab size limit, a new
+        slab file is started.
 
         Must be called under ``self.disk_lock`` or from a single-
         threaded context (``batched_submit_put_task`` is already
@@ -727,8 +788,11 @@ class KVStreamDiskBackend(StorageBackendInterface):
             and the byte offset within it for this allocation.
         """
         cur_offset = self._slab_offsets[tier_index]
+        slab_limit = (
+            self._tiers[tier_index].config.slab_size_mb * 1024 * 1024
+        )
         # Roll over to a new slab if this allocation would exceed limit
-        if cur_offset > 0 and cur_offset + size > self._slab_size_limit:
+        if cur_offset > 0 and cur_offset + size > slab_limit:
             self._slab_counters[tier_index] += 1
             cur_offset = 0
 
@@ -873,17 +937,20 @@ class KVStreamDiskBackend(StorageBackendInterface):
         self.usage -= total_size
         self.stats_monitor.update_local_storage_usage(self.usage)
 
-        # Delete the file on every tier.  In slab mode, do NOT delete
-        # the slab file — other chunks share it.
-        if self._slab_size_limit == 0:
-            for tier_slice in meta.slices:
-                try:
-                    os.remove(tier_slice.path)
-                except FileNotFoundError:
-                    logger.warning(
-                        "KVStream: file already removed: %s",
-                        tier_slice.path,
-                    )
+        # Delete the file on tiers using file-per-chunk mode.
+        # In slab mode, do NOT delete the slab file — other chunks
+        # share it.
+        for tier_slice in meta.slices:
+            tc = self._tiers[tier_slice.tier_index].config
+            if tc.slab_size_mb > 0:
+                continue
+            try:
+                os.remove(tier_slice.path)
+            except FileNotFoundError:
+                logger.warning(
+                    "KVStream: file already removed: %s",
+                    tier_slice.path,
+                )
 
         if force:
             self.cache_policy.update_on_force_evict(key)
@@ -1124,15 +1191,16 @@ class KVStreamDiskBackend(StorageBackendInterface):
             self.current_cache_size -= group.total_size
 
         # Clean up any partially written files (best-effort).
-        # In slab mode, do NOT delete the slab file — other chunks
-        # share it.  The wasted space is acceptable (no eviction).
-        if self._slab_size_limit == 0:
-            for tier in self._tiers:
-                path = self._key_to_tier_path(group.key, tier)
-                try:
-                    os.remove(path)
-                except FileNotFoundError:
-                    pass
+        # Only delete files for file-per-chunk tiers; slab tiers
+        # share files so deletion would corrupt other chunks.
+        for tier in self._tiers:
+            if tier.config.slab_size_mb > 0:
+                continue
+            path = self._key_to_tier_path(group.key, tier)
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
 
         # Remove any remaining hashes for this group still in the map
         for h in group.io_hashes:
@@ -1250,16 +1318,19 @@ class KVStreamDiskBackend(StorageBackendInterface):
 
             # Build per-tier I/O descriptors
             save_ops: list[tuple[Any, str, torch.Tensor, str, int]] = []
-            use_slab = self._slab_size_limit > 0
+            # When ANY tier uses slabs we must pre-build tier slices
+            # so that _resolve_completed_group can recover the correct
+            # file offsets (which _build_tier_slices cannot reconstruct
+            # for slab tiers).
             slab_tier_slices: Optional[list[_TierSlice]] = (
-                [] if use_slab else None
+                [] if self._any_slab_enabled else None
             )
             for tier in self._tiers:
                 tc = tier.config
                 tier_layer_bytes = tc.num_layers * self._per_layer_bytes
                 tier_size = self._kv_size * tier_layer_bytes
 
-                if use_slab:
+                if tc.slab_size_mb > 0:
                     path, slab_base = self._allocate_slab_space(
                         tc.index, tier_size
                     )
@@ -1267,8 +1338,9 @@ class KVStreamDiskBackend(StorageBackendInterface):
                     path = self._key_to_tier_path(key, tier)
                     slab_base = 0
 
-                # Pre-build tier slice for slab mode (captures the
-                # slab path and base offset at allocation time).
+                # Pre-build tier slice (captures path and base offset
+                # at allocation time for slab tiers; file-per-chunk
+                # tiers get slab_base=0 which is correct).
                 if slab_tier_slices is not None:
                     slab_tier_slices.append(
                         _TierSlice(
@@ -1331,13 +1403,19 @@ class KVStreamDiskBackend(StorageBackendInterface):
     def flush_deferred_writes(self) -> int:
         """Submit all deferred writes to the io_uring engines.
 
-        Called after all reads for the current step complete, so writes
-        never contend with reads on the NVMe.
+        Called at the start of the next step, before reads begin.
+        For tiers with ``locking="rw"``, blocks until all in-flight
+        writes on that tier's engine complete, preventing read/write
+        contention on the storage device.
 
         Returns:
             Number of logical chunks flushed.
         """
         if not self._deferred_queue:
+            # Even with no new deferred writes, we must still
+            # wait for previously-submitted writes on rw-locked
+            # tiers to finish before the caller starts reads.
+            self._wait_rw_locked_tiers()
             return 0
 
         self._drain_completed()
@@ -1364,7 +1442,37 @@ class KVStreamDiskBackend(StorageBackendInterface):
             total_bytes / 1e6,
             elapsed_ms,
         )
+
+        # Block until writes complete on rw-locked tiers so
+        # subsequent reads don't contend with in-flight writes.
+        self._wait_rw_locked_tiers()
+
         return n
+
+    def _wait_rw_locked_tiers(self) -> None:
+        """Block until all in-flight writes complete on rw-locked tiers.
+
+        Called by ``flush_deferred_writes`` to ensure write I/O is
+        fully drained before reads start on tiers configured with
+        ``locking="rw"``.  Tiers with ``locking="none"`` are skipped.
+        """
+        io_queue_write = self.kvstream_core.IOQueue.WRITE
+        for tier in self._tiers:
+            if tier.config.locking != "rw":
+                continue
+            t0 = time.perf_counter()
+            torch.cuda.nvtx.range_push(
+                f"kvs_wait_wr_t{tier.config.index}"
+            )
+            tier.engine.wait_all(io_queue_write)
+            torch.cuda.nvtx.range_pop()
+            elapsed_ms = (time.perf_counter() - t0) * 1e3
+            if elapsed_ms > 1.0:
+                logger.info(
+                    "KVStream: wait_all(WRITE) tier %d: %.2f ms",
+                    tier.config.index,
+                    elapsed_ms,
+                )
 
     # ------------------------------------------------------------------ #
     #  Get (read) path — P-tier layer-striped                             #
