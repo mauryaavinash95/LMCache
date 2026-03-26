@@ -165,10 +165,12 @@ class _TieredChunkMeta:
 
 @dataclass
 class _InflightGroup:
-    """Tracks all sub-write I/O ops for one logical chunk across P tiers.
+    """Tracks all sub-write I/O ops for one logical chunk.
 
-    A single chunk produces ``2 * P`` I/O hashes (K-block + V-block per
-    tier).  The group is resolved when ``remaining`` reaches zero.
+    In layer_stripe mode a chunk produces ``2 * P`` I/O hashes
+    (K-block + V-block per tier).  In whole_chunk mode a chunk goes
+    to one tier, producing ``2`` hashes (K + V).  The group is
+    resolved when ``remaining`` reaches zero.
     """
 
     key: CacheEngineKey
@@ -393,6 +395,21 @@ class KVStreamDiskBackend(StorageBackendInterface):
         while len(slab_sizes) < num_tiers:
             slab_sizes.append(slab_sizes[-1])
 
+        # Chunk placement mode: "layer_stripe" (default) splits each
+        # chunk's layers across tiers; "whole_chunk" places each chunk
+        # entirely on one tier using weighted round-robin.
+        placement_str: str = str(
+            extra.get("kvstream_placement", "layer_stripe")
+        ).strip().lower()
+        if placement_str not in ("layer_stripe", "whole_chunk"):
+            raise ValueError(
+                f"kvstream_placement: unknown mode '{placement_str}'. "
+                "Valid values: 'layer_stripe', 'whole_chunk'"
+            )
+        self._whole_chunk_placement: bool = (
+            placement_str == "whole_chunk"
+        )
+
         # Determine num_layers from metadata.  metadata may be None in
         # some test/scheduler contexts; fall back to kv_shape if available.
         if metadata is not None:
@@ -415,7 +432,14 @@ class KVStreamDiskBackend(StorageBackendInterface):
             hidden_dim = 0
             dtype_size = 0
 
-        boundaries = _compute_layer_boundaries(ratios, self._num_layers)
+        if self._whole_chunk_placement:
+            # In whole_chunk mode every tier handles all layers;
+            # ratios control chunk-to-tier assignment, not layer splits.
+            boundaries = [0] + [self._num_layers] * num_tiers
+        else:
+            boundaries = _compute_layer_boundaries(
+                ratios, self._num_layers
+            )
 
         # Per-layer byte size: T * D * dtype_size (for one KV-component,
         # one layer).  The K-block and V-block each contain
@@ -440,7 +464,10 @@ class KVStreamDiskBackend(StorageBackendInterface):
         # leaked inflight groups.
         self._tiers: list[_TierState] = []
         for i in range(num_tiers):
-            if boundaries[i] == boundaries[i + 1]:
+            if (
+                not self._whole_chunk_placement
+                and boundaries[i] == boundaries[i + 1]
+            ):
                 logger.info(
                     "KVStream: skipping tier %d (zero layers assigned)", i
                 )
@@ -471,8 +498,14 @@ class KVStreamDiskBackend(StorageBackendInterface):
                 index=tier_index,
                 path=tier_path,
                 ratio=ratios[i],
-                layer_start=boundaries[i],
-                layer_end=boundaries[i + 1],
+                layer_start=(
+                    0 if self._whole_chunk_placement
+                    else boundaries[i]
+                ),
+                layer_end=(
+                    self._num_layers if self._whole_chunk_placement
+                    else boundaries[i + 1]
+                ),
                 read_chunk_size_kb=int(
                     extra.get(
                         f"kvstream_tier_{i}_read_chunk_size_kb",
@@ -661,9 +694,29 @@ class KVStreamDiskBackend(StorageBackendInterface):
                 ", ".join(slab_tiers),
             )
 
+        # -- Whole-chunk placement state --------------------------------
+        if self._whole_chunk_placement:
+            # Build a weighted round-robin pattern from ratios.
+            # E.g. ratios [0.5, 0.5] → pattern [0, 1] (length 2)
+            #      ratios [0.7, 0.3] → pattern [0,0,0,0,0,0,0, 1,1,1]
+            self._wc_pattern: list[int] = []
+            for tier in self._tiers:
+                count = max(1, round(tier.config.ratio * 100))
+                self._wc_pattern.extend(
+                    [tier.config.index] * count
+                )
+            self._wc_counter: int = 0
+            logger.info(
+                "KVStream whole-chunk placement: pattern_len=%d, "
+                "tiers=%s",
+                len(self._wc_pattern),
+                [t.config.index for t in self._tiers],
+            )
+
         # -- Consolidated kvstream config log ----------------------------
         logger.info(
-            "KVStream config: kvstream_slab_size_mb=%s, "
+            "KVStream config: kvstream_placement=%s, "
+            "kvstream_slab_size_mb=%s, "
             "kvstream_deferred_writes=%s, "
             "kvstream_drain_poll_interval_s=%.3f, "
             "kvstream_read_chunk_size_kb=%d, "
@@ -677,6 +730,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
             "kvstream_tier_locking=%s, "
             "num_tiers=%d, num_layers=%d, "
             "per_layer_bytes=%d, kv_block_bytes=%d",
+            placement_str,
             slab_str,
             self._deferred_writes_enabled,
             drain_interval,
@@ -1307,7 +1361,10 @@ class KVStreamDiskBackend(StorageBackendInterface):
             group = _InflightGroup(
                 key=key,
                 memory_obj=memory_obj,
-                remaining=self._kv_size * num_tiers,
+                remaining=self._kv_size * (
+                    1 if self._whole_chunk_placement
+                    else num_tiers
+                ),
                 total_size=total_size,
                 shape=shape,
                 dtype=dtype,
@@ -1318,14 +1375,30 @@ class KVStreamDiskBackend(StorageBackendInterface):
 
             # Build per-tier I/O descriptors
             save_ops: list[tuple[Any, str, torch.Tensor, str, int]] = []
-            # When ANY tier uses slabs we must pre-build tier slices
-            # so that _resolve_completed_group can recover the correct
-            # file offsets (which _build_tier_slices cannot reconstruct
-            # for slab tiers).
-            slab_tier_slices: Optional[list[_TierSlice]] = (
-                [] if self._any_slab_enabled else None
+            # Pre-built tier slices are required when slabs are used
+            # (offsets can't be reconstructed) or in whole_chunk mode
+            # (_build_tier_slices would wrongly produce slices for
+            # ALL tiers).
+            need_prebuilt_slices = (
+                self._any_slab_enabled
+                or self._whole_chunk_placement
             )
-            for tier in self._tiers:
+            slab_tier_slices: Optional[list[_TierSlice]] = (
+                [] if need_prebuilt_slices else None
+            )
+
+            # In whole_chunk mode, pick ONE tier via weighted
+            # round-robin; in layer_stripe mode, use all tiers.
+            if self._whole_chunk_placement:
+                tier_idx = self._wc_pattern[
+                    self._wc_counter % len(self._wc_pattern)
+                ]
+                self._wc_counter += 1
+                tiers_for_chunk = [self._tiers[tier_idx]]
+            else:
+                tiers_for_chunk = self._tiers
+
+            for tier in tiers_for_chunk:
                 tc = tier.config
                 tier_layer_bytes = tc.num_layers * self._per_layer_bytes
                 tier_size = self._kv_size * tier_layer_bytes
