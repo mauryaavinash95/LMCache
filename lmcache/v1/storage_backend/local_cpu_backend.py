@@ -578,7 +578,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                         for _v in self.hot_cache.values():
                             if _v.is_pinned:
                                 _n_pinned += 1
-                            if _v.ref_count > 1:
+                            if _v.get_ref_count() > 1:
                                 _n_ref_gt1 += 1
                             if _v.can_evict:
                                 _n_evictable += 1

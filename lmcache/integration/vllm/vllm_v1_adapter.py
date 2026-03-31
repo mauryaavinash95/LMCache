@@ -590,6 +590,14 @@ class LMCacheConnectorV1Impl:
         # start_load_kv, consumed by _emit_step_log.
         self._kvstream_last_tier_stats: list = []
 
+        # ---- Per-step wall-clock instrumentation ----
+        # Timestamps set in start_load_kv, consumed in wait_for_save.
+        self._step_t1: float = 0.0  # entry of start_load_kv
+        self._step_t2: float = 0.0  # after flush_deferred_writes
+        self._step_t3: float = 0.0  # after all retrieval (end of start_load_kv)
+        self._step_timing_counter: int = 0
+        self._step_timing_total_tokens: int = 0
+
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
         if self.lmcache_engine is None:
@@ -775,6 +783,11 @@ class LMCacheConnectorV1Impl:
             The number of elements in kv_caches and layer_names should be
             the same.
         """
+        # T1: entry of start_load_kv
+        self._step_t1 = time.perf_counter()
+        self._step_timing_counter += 1
+        self._step_timing_total_tokens = 0
+
         self.current_layer = 0
 
         if len(self.kv_caches) == 0:
@@ -787,6 +800,10 @@ class LMCacheConnectorV1Impl:
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
 
+        # Compute total tokens scheduled for this step
+        for request in metadata.requests:
+            self._step_timing_total_tokens += len(request.token_ids)
+
         assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
 
@@ -796,6 +813,9 @@ class LMCacheConnectorV1Impl:
             # Still flush deferred writes — no reads this step means
             # writes can proceed with zero contention.
             self._flush_deferred_writes_if_enabled()
+            # T2=T3=now for empty steps (no retrieval)
+            self._step_t2 = time.perf_counter()
+            self._step_t3 = self._step_t2
             return
 
         assert self.lmcache_engine is not None
@@ -822,20 +842,31 @@ class LMCacheConnectorV1Impl:
             and not self.use_layerwise
             and self._kvstream_backend is not None
         ):
+            # Flush deferred writes from previous step BEFORE
+            # submitting this step's reads.
+            self._flush_deferred_writes_if_enabled()
+
+            # T2: after flush, before retrieve
+            self._step_t2 = time.perf_counter()
+
             self._start_load_kv_overlapped(
                 metadata, kvcaches,
             )
-            self._flush_deferred_writes_if_enabled()
 
             if self._kvstream_backend is not None:
                 self._kvstream_last_tier_stats = (
                     self._kvstream_backend.get_tier_stats_and_reset()
                 )
+            # T3: after all retrieval complete
+            self._step_t3 = time.perf_counter()
             return
 
         # -------------------------------------------------------------- #
         # Default per-request retrieve path                               #
         # -------------------------------------------------------------- #
+        # T2: after flush (if any), before retrieve
+        self._step_t2 = time.perf_counter()
+
         for idx, request in enumerate(metadata.requests):
             # Update metrics for all requests that have a load_spec
             if request.load_spec is not None:
@@ -969,6 +1000,9 @@ class LMCacheConnectorV1Impl:
             self._kvstream_last_tier_stats = (
                 self._kvstream_backend.get_tier_stats_and_reset()
             )
+
+        # T3: after all retrieval complete (default path)
+        self._step_t3 = time.perf_counter()
 
     @_lmcache_nvtx_annotate
     def _start_load_kv_overlapped(
@@ -1487,12 +1521,15 @@ class LMCacheConnectorV1Impl:
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
         """Blocking until the KV cache is saved to the connector buffer."""
+        # T4: entry of wait_for_save (= end of GPU forward pass)
+        _t4 = time.perf_counter()
 
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
 
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
+            self._emit_step_timing(_t4)
             return
 
         if self.use_layerwise:
@@ -1504,6 +1541,7 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_storer)
                 # unpin the kv caches according to req_id
                 self.lmcache_engine.lookup_unpin(request.req_id)
+            self._emit_step_timing(_t4)
             return
 
         assert len(self.kv_caches) > 0
@@ -1641,6 +1679,80 @@ class LMCacheConnectorV1Impl:
                 save_spec.skip_leading_tokens = len(token_ids)
                 if request.disagg_spec:
                     request.disagg_spec.num_transferred_tokens = len(token_ids)
+
+        self._emit_step_timing(_t4)
+
+    def _emit_step_timing(self, t4: float) -> None:
+        """Emit per-step wall-clock timing breakdown (TP0 only).
+
+        Logs a single line per step with the time spent in each phase:
+        flush (deferred writes), retrieve (disk+CPU I/O + H2D copy),
+        forward (GPU compute), and store (GPU->CPU copy + enqueue).
+        When KVStream tier stats are available, appends per-tier
+        read/write throughput and timing.
+
+        Args:
+            t4: ``time.perf_counter()`` taken at the entry of
+                ``wait_for_save`` (i.e. end of GPU forward pass).
+        """
+        t5 = time.perf_counter()
+
+        # Only log from rank 0 to avoid noise from all TP ranks.
+        _meta = (
+            self.lmcache_engine.metadata
+            if self.lmcache_engine is not None
+            else None
+        )
+        if _meta is None or _meta.worker_id != 0:
+            return
+
+        t1 = self._step_t1
+        t2 = self._step_t2
+        t3 = self._step_t3
+        # Guard against uninitialised timestamps (e.g. first step
+        # where start_load_kv may not have been called yet).
+        if t1 == 0.0:
+            return
+
+        flush_ms = (t2 - t1) * 1e3
+        retrieve_ms = (t3 - t2) * 1e3
+        forward_ms = (t4 - t3) * 1e3
+        store_ms = (t5 - t4) * 1e3
+        total_ms = (t5 - t1) * 1e3
+
+        # Build per-tier suffix if stats are available
+        tier_parts = ""
+        for ts in self._kvstream_last_tier_stats:
+            tier_parts += (
+                f" t{ts['tier']}"
+                f"_rd={ts['read_bytes']/1e6:.1f}MB"
+                f"/{ts['read_bw_mb_s']}MB_s"
+                f"/{ts['read_elapsed_ms']}ms"
+                f"/{ts['read_ops']}ops"
+            )
+            if ts.get("write_bytes", 0) > 0:
+                tier_parts += (
+                    f" t{ts['tier']}"
+                    f"_wr={ts['write_bytes']/1e6:.1f}MB"
+                    f"/{ts['write_bw_mb_s']}MB_s"
+                    f"/{ts['write_elapsed_ms']}ms"
+                    f"/{ts['write_ops']}ops"
+                )
+
+        logger.info(
+            "STEP_TIMING step=%d total=%.1fms "
+            "flush=%.1fms retrieve=%.1fms "
+            "forward=%.1fms store=%.1fms "
+            "tokens=%d%s",
+            self._step_timing_counter,
+            total_ms,
+            flush_ms,
+            retrieve_ms,
+            forward_ms,
+            store_ms,
+            self._step_timing_total_tokens,
+            tier_parts,
+        )
 
     @_lmcache_nvtx_annotate
     def get_finished(
