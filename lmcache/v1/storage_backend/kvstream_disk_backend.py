@@ -2663,6 +2663,12 @@ class KVStreamDiskBackend(StorageBackendInterface):
                 )
                 if group_hash is None:
                     continue
+                # When multiple steal sub-hashes (K+V) for the
+                # same group complete in the same drain batch,
+                # the first one resolves the group.  Subsequent
+                # ones find it already deleted — skip them.
+                if group_hash not in self._group_pending_count:
+                    continue
                 remaining = self._group_pending_count[group_hash]
                 if remaining > 0:
                     continue
