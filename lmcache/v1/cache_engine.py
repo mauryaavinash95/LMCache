@@ -1773,6 +1773,11 @@ class LMCacheEngine:
         from lmcache.v1.storage_backend.kvstream_disk_backend import (
             KVStreamDiskBackend,
         )
+        from lmcache.v1.storage_backend.kvstream_block_backend import (
+            KVStreamBlockReplicatedBackend,
+        )
+
+        _KVStreamTypes = (KVStreamDiskBackend, KVStreamBlockReplicatedBackend)
 
         assert self.storage_manager is not None
         assert self.gpu_connector is not None
@@ -1823,7 +1828,7 @@ class LMCacheEngine:
 
             if (
                 location == "KVStreamDiskBackend"
-                and isinstance(kvstream_backend, KVStreamDiskBackend)
+                and isinstance(kvstream_backend, _KVStreamTypes)
             ):
                 # --- OVERLAPPED PATH: KVStream ---
                 # Submit all io_uring reads at once (non-blocking).
@@ -1958,7 +1963,7 @@ class LMCacheEngine:
         tier_stats_list: list = []
         if (
             disk_chunks > 0
-            and isinstance(kvstream_backend, KVStreamDiskBackend)
+            and isinstance(kvstream_backend, _KVStreamTypes)
         ):
             tier_stats_list = (
                 kvstream_backend.get_tier_read_stats()
@@ -2038,6 +2043,11 @@ class LMCacheEngine:
         from lmcache.v1.storage_backend.kvstream_disk_backend import (
             KVStreamDiskBackend,
         )
+        from lmcache.v1.storage_backend.kvstream_block_backend import (
+            KVStreamBlockReplicatedBackend,
+        )
+
+        _KVStreamTypes = (KVStreamDiskBackend, KVStreamBlockReplicatedBackend)
 
         assert self.storage_manager is not None
 
@@ -2081,7 +2091,7 @@ class LMCacheEngine:
         # Submit disk reads (non-blocking)
         disk_blocks = block_mapping.get("KVStreamDiskBackend", [])
         if disk_blocks and isinstance(
-            kvstream_backend, KVStreamDiskBackend
+            kvstream_backend, _KVStreamTypes
         ):
             disk_keys = [key for key, _, _ in disk_blocks]
             t_sub_start = time.perf_counter()
@@ -2248,6 +2258,11 @@ class LMCacheEngine:
         from lmcache.v1.storage_backend.kvstream_disk_backend import (
             KVStreamDiskBackend,
         )
+        from lmcache.v1.storage_backend.kvstream_block_backend import (
+            KVStreamBlockReplicatedBackend,
+        )
+
+        _KVStreamTypes = (KVStreamDiskBackend, KVStreamBlockReplicatedBackend)
 
         assert self.gpu_connector is not None
 
@@ -2278,7 +2293,7 @@ class LMCacheEngine:
         tier_stats_list: list = []
         if (
             state.disk_chunks > 0
-            and isinstance(kvstream_backend, KVStreamDiskBackend)
+            and isinstance(kvstream_backend, _KVStreamTypes)
         ):
             tier_stats_list = (
                 kvstream_backend.get_tier_read_stats()

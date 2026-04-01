@@ -200,19 +200,39 @@ def CreateStorageBackends(
         if config.kvstream_enable:
             # Use KVStream (io_uring) as the disk I/O engine instead of
             # the default Python open()/write()/read() thread-pool.
-            # First Party
-            from lmcache.v1.storage_backend.kvstream_disk_backend import (
-                KVStreamDiskBackend,
-            )
+            _extra = config.extra_config or {}
+            _placement = str(
+                _extra.get("kvstream_placement", "layer_stripe")
+            ).strip().lower()
 
-            disk_backend = KVStreamDiskBackend(
-                config,
-                loop,
-                local_cpu_backend,
-                dst_device,
-                lmcache_worker,
-                metadata,
-            )
+            if _placement == "block_replicated":
+                # First Party
+                from lmcache.v1.storage_backend.kvstream_block_backend import (
+                    KVStreamBlockReplicatedBackend,
+                )
+
+                disk_backend = KVStreamBlockReplicatedBackend(
+                    config,
+                    loop,
+                    local_cpu_backend,
+                    dst_device,
+                    lmcache_worker,
+                    metadata,
+                )
+            else:
+                # First Party
+                from lmcache.v1.storage_backend.kvstream_disk_backend import (
+                    KVStreamDiskBackend,
+                )
+
+                disk_backend = KVStreamDiskBackend(
+                    config,
+                    loop,
+                    local_cpu_backend,
+                    dst_device,
+                    lmcache_worker,
+                    metadata,
+                )
         else:
             disk_backend = LocalDiskBackend(
                 config,
