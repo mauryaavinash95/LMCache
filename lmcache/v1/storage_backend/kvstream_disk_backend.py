@@ -756,6 +756,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
 
         # -- Replicated-chunks state -------------------------------------
         self._work_steal_state: Optional[_WorkStealState] = None
+        self._pending_steal_pool: list[tuple] = []
         if self._replicated_chunks:
             if len(self._tiers) < 2:
                 raise ValueError(
@@ -2283,7 +2284,11 @@ class KVStreamDiskBackend(StorageBackendInterface):
             results.append((group_hash, key, memory_obj))
 
         if steal_pool:
-            self._init_work_stealing(steal_pool)
+            # Accumulate — do NOT init yet.  submit_batch_load may
+            # be called multiple times per step (once per request).
+            # Work-stealing is initialized lazily on the first
+            # wait_any_load call.
+            self._pending_steal_pool.extend(steal_pool)
 
         return results
 
@@ -2406,6 +2411,15 @@ class KVStreamDiskBackend(StorageBackendInterface):
             List of ``(group_hash, key, memory_obj)`` for every
             chunk whose reads across all tiers finished.
         """
+        # Lazy init: collect all steal items from possibly multiple
+        # submit_batch_load calls before starting the scheduler.
+        if (
+            self._work_steal_state is None
+            and self._pending_steal_pool
+        ):
+            self._init_work_stealing(self._pending_steal_pool)
+            self._pending_steal_pool = []
+
         ready: list[
             tuple[str, CacheEngineKey, MemoryObj]
         ] = []
@@ -2463,6 +2477,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
             and not self._group_pending_count
         ):
             self._work_steal_state = None
+            self._pending_steal_pool = []
 
         return ready
 
