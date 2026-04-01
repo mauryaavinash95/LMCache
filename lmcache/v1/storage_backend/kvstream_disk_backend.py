@@ -2555,6 +2555,19 @@ class KVStreamDiskBackend(StorageBackendInterface):
             self._work_steal_state is not None
             and not self._group_pending_count
         ):
+            # Remove dangling steal sub-hash references.  When
+            # NVMe re-steals PFS items, both tiers submit reads
+            # for the same item.  The winning tier's completions
+            # resolve the group, but the losing tier's sub-hashes
+            # may still be in-flight (or already completed but not
+            # yet drained).  Clean up their tracking entries so
+            # they don't interfere with the next step.
+            ws = self._work_steal_state
+            for sh in ws.sub_to_item:
+                ti = self._sub_to_tier_idx.pop(sh, None)
+                if ti is not None:
+                    self._tier_pending_subs[ti] -= 1
+                self._sub_to_group.pop(sh, None)
             self._work_steal_state = None
             self._pending_steal_pool = []
 
