@@ -34,7 +34,6 @@ Activated when ``config.kvstream_enable`` is ``True`` and
 """
 
 # Standard
-import collections
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
@@ -163,48 +162,6 @@ class _TieredChunkMeta:
         """Return whether this entry can be evicted."""
         return not self.is_pinned
 
-    @property
-    def is_replicated(self) -> bool:
-        """Return whether any layer range is stored on multiple tiers.
-
-        In ``replicated_chunks`` mode, a fully replicated chunk has 3
-        slices (2 original + 1 NVMe replica of the PFS sub-chunk).
-        """
-        tier_indices = {s.tier_index for s in self.slices}
-        return len(self.slices) > len(tier_indices)
-
-
-@dataclass
-class _WorkStealState:
-    """Per-step work-stealing state for replicated sub-chunk-B reads.
-
-    Manages the bidirectional cursor scheme: NVMe steals from the front
-    (index 0 upward), PFS steals from the back (index M-1 downward).
-    When cursors cross, both tiers may read the same sub-chunk — this
-    is safe because the data is identical.
-    """
-
-    # Each item: (group_hash, key, memory_obj, meta, raw_tensor, sub_b_layer_start, sub_b_layer_end)
-    items: list[tuple[str, CacheEngineKey, MemoryObj, "_TieredChunkMeta", torch.Tensor, int, int]]
-
-    nvme_cursor: int = 0       # next item to assign to NVMe (front)
-    pfs_cursor: int = -1       # next item to assign to PFS (back) — set to len-1
-
-    nvme_inflight: int = 0     # steal reads currently in-flight on NVMe
-    pfs_inflight: int = 0      # steal reads currently in-flight on PFS
-    max_inflight_per_tier: int = 2
-
-    # sub_hash -> item index in self.items
-    sub_to_item_idx: dict[str, int] = field(default_factory=dict)
-    # item indices whose sub-chunk-B has been completed by any tier
-    completed_items: set[int] = field(default_factory=set)
-    # Track how many steal sub-hashes are outstanding for each item
-    # so we can ignore late arrivals from the other tier.
-    item_steal_done: set[int] = field(default_factory=set)
-    # Per-item count of K+V sub-hash completions (need kv_size to
-    # mark item done).
-    item_sub_completions: dict[int, int] = field(default_factory=dict)
-
 
 @dataclass
 class _InflightGroup:
@@ -231,9 +188,39 @@ class _InflightGroup:
     # _resolve_completed_group uses these instead of calling
     # _build_tier_slices (which cannot reconstruct slab offsets).
     tier_slices: Optional[list[_TierSlice]] = None
-    # True for background replication writes (routed to
-    # _resolve_replication_group instead of _resolve_completed_group).
-    is_replication: bool = False
+
+
+@dataclass
+class _WorkStealState:
+    """Per-step work-stealing state for replicated sub-chunk reads.
+
+    NVMe steals from the front (index 0 upward), PFS steals from the
+    back (index M-1 downward).  When cursors cross, both tiers may
+    read the same item — this is safe because the data is identical
+    and writes to the same buffer region.
+
+    Each "item" corresponds to one chunk's replicated sub-chunk
+    (the layer range that exists on BOTH NVMe and PFS).  An item
+    requires ``kv_size`` sub-hash completions (K + V) from ANY
+    single tier before it is considered done.
+    """
+
+    # (group_hash, key, meta, raw_tensor, layer_start, layer_end)
+    items: list[tuple]
+
+    nvme_cursor: int = 0    # next item for NVMe (front, increasing)
+    pfs_cursor: int = -1    # next item for PFS (back, decreasing)
+
+    nvme_inflight: int = 0
+    pfs_inflight: int = 0
+    max_inflight_per_tier: int = 2
+
+    # sub_hash -> item index
+    sub_to_item: dict[str, int] = field(default_factory=dict)
+    # item index -> count of completed sub-hashes (need kv_size)
+    item_completions: dict[int, int] = field(default_factory=dict)
+    # items fully resolved (first tier to complete kv_size wins)
+    done_items: set[int] = field(default_factory=set)
 
 
 # ======================================================================== #
@@ -490,8 +477,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
             boundaries = [0] + [self._num_layers] * num_tiers
         else:
             # Both layer_stripe and replicated_chunks use the same
-            # layer boundaries; replicated_chunks adds NVMe replication
-            # of the PFS sub-chunk on top.
+            # layer boundaries derived from split_ratios.
             boundaries = _compute_layer_boundaries(
                 ratios, self._num_layers
             )
@@ -614,7 +600,6 @@ class KVStreamDiskBackend(StorageBackendInterface):
                 max_fds_open=tc.max_fds,
                 try_using_odirect=tc.try_odirect,
                 max_retries=tc.max_retries,
-                log_level=kvstream_core.LogLevel.DEBUG,
             )
 
             self._tiers.append(_TierState(config=tc, engine=engine))
@@ -770,49 +755,39 @@ class KVStreamDiskBackend(StorageBackendInterface):
             )
 
         # -- Replicated-chunks state -------------------------------------
+        self._work_steal_state: Optional[_WorkStealState] = None
         if self._replicated_chunks:
             if len(self._tiers) < 2:
                 raise ValueError(
                     "replicated_chunks requires at least 2 tiers."
                 )
-            self._repl_queue: collections.deque[
-                tuple[CacheEngineKey, MemoryObj]
-            ] = collections.deque()
-            self._repl_inflight: int = 0
-            self._repl_max_inflight: int = int(
-                extra.get("kvstream_replication_max_inflight", 2)
-            )
-            self._repl_pressure_threshold: float = float(
-                extra.get(
-                    "kvstream_replication_pressure_threshold", 0.8
-                )
-            )
-            self._repl_steal_batch: int = int(
+            self._steal_batch: int = int(
                 extra.get("kvstream_steal_batch_size", 2)
             )
-            # Replication write tracking (io_hash -> (key, memory_obj))
-            self._repl_hash_to_meta: dict[
-                str, tuple[CacheEngineKey, MemoryObj, list[_TierSlice]]
-            ] = {}
-            self._repl_pending_count: dict[str, int] = {}
-            # Work-stealing state (set during submit_batch_load,
-            # consumed during wait_any_load).
-            self._work_steal_state: Optional[_WorkStealState] = None
-            # NVMe tier (tier 0) is the replication target.
-            self._nvme_tier: _TierState = self._tiers[0]
-            # The sub-chunk that gets replicated: PFS-exclusive layers.
-            self._repl_layer_start: int = self._tiers[1].config.layer_start
-            self._repl_layer_end: int = self._tiers[1].config.layer_end
-            # Counter for replication-specific unique file names
-            self._repl_file_counter: int = 0
-            self._repl_file_lock = threading.Lock()
+            # NVMe = tier 0, PFS = tier 1.
+            # NVMe-exclusive layer range: layers that ONLY NVMe has.
+            # Replicated layer range: layers on BOTH NVMe and PFS.
+            self._nvme_tier_idx: int = 0
+            self._pfs_tier_idx: int = 1
+            self._excl_layer_start: int = (
+                self._tiers[0].config.layer_start
+            )
+            self._excl_layer_end: int = (
+                self._tiers[1].config.layer_start
+            )
+            self._repl_layer_start: int = (
+                self._tiers[1].config.layer_start
+            )
+            self._repl_layer_end: int = (
+                self._tiers[1].config.layer_end
+            )
             logger.info(
-                "KVStream replicated_chunks enabled: "
-                "max_inflight=%d, pressure_threshold=%.2f, "
-                "steal_batch=%d, repl_layers=[%d,%d)",
-                self._repl_max_inflight,
-                self._repl_pressure_threshold,
-                self._repl_steal_batch,
+                "KVStream replicated_chunks: steal_batch=%d, "
+                "exclusive_layers=[%d,%d), "
+                "replicated_layers=[%d,%d)",
+                self._steal_batch,
+                self._excl_layer_start,
+                self._excl_layer_end,
                 self._repl_layer_start,
                 self._repl_layer_end,
             )
@@ -1271,8 +1246,6 @@ class KVStreamDiskBackend(StorageBackendInterface):
                     groups_resolved += 1
                     if group.failed:
                         self._resolve_failed_group(group)
-                    elif group.is_replication:
-                        self._resolve_replication_group(group)
                     else:
                         self._resolve_completed_group(group)
 
@@ -1288,11 +1261,6 @@ class KVStreamDiskBackend(StorageBackendInterface):
                     elapsed_ms,
                 )
 
-        # Pump replication queue outside the drain lock to avoid
-        # holding it while submitting new I/O.
-        if self._replicated_chunks:
-            self._pump_replication_queue()
-
     def _resolve_completed_group(self, group: _InflightGroup) -> None:
         """Finalize a successfully completed write group.
 
@@ -1301,13 +1269,6 @@ class KVStreamDiskBackend(StorageBackendInterface):
         """
         self.usage += group.total_size
         self.stats_monitor.update_local_storage_usage(self.usage)
-
-        # In replicated_chunks mode, enqueue replication BEFORE
-        # releasing the buffer so the memory_obj stays alive.
-        if self._replicated_chunks:
-            self._maybe_enqueue_replication(
-                group.key, group.memory_obj
-            )
 
         # Release buffer before registering key (matches
         # LocalDiskBackend ordering for mem-leak test compatibility).
@@ -1346,31 +1307,11 @@ class KVStreamDiskBackend(StorageBackendInterface):
         """Finalize a failed write group.
 
         Releases the buffer, removes the put task, rolls back capacity,
-        and cleans up any partially written files.  For replication
-        groups, only releases the buffer and decrements inflight.
+        and cleans up any partially written files.
 
         Args:
             group: The failed inflight group.
         """
-        if group.is_replication:
-            # Replication failure: release ref, fix inflight count,
-            # clean up partial replica file.
-            logger.warning(
-                "KVStream: replication write failed for key %s",
-                group.key,
-            )
-            self._repl_inflight -= 1
-            group.memory_obj.ref_count_down()
-            if group.tier_slices:
-                for ts in group.tier_slices:
-                    try:
-                        os.remove(ts.path)
-                    except FileNotFoundError:
-                        pass
-            for h in group.io_hashes:
-                self._hash_to_group.pop(h, None)
-            return
-
         logger.error(
             "KVStream: write failed for key %s", group.key
         )
@@ -1397,202 +1338,6 @@ class KVStreamDiskBackend(StorageBackendInterface):
         # Remove any remaining hashes for this group still in the map
         for h in group.io_hashes:
             self._hash_to_group.pop(h, None)
-
-    # ------------------------------------------------------------------ #
-    #  Replicated-chunks: background replication to NVMe                  #
-    # ------------------------------------------------------------------ #
-
-    def _maybe_enqueue_replication(
-        self, key: CacheEngineKey, memory_obj: MemoryObj
-    ) -> None:
-        """Enqueue a chunk for background NVMe replication if eligible.
-
-        Called after a primary write completes or after a disk read
-        fills the CPU buffer.  The caller must ensure ``memory_obj``
-        is still alive (ref_count > 0).
-
-        Args:
-            key: The cache engine key.
-            memory_obj: CPU buffer containing the full chunk data.
-        """
-        if not self._replicated_chunks:
-            return
-        # Check: is this key already fully replicated?
-        with self.disk_lock:
-            meta = self.dict.get(key)
-            if meta is not None and meta.is_replicated:
-                return
-        # Hold the buffer alive for the replication write.
-        memory_obj.ref_count_up()
-        self._repl_queue.append((key, memory_obj))
-
-    def _pump_replication_queue(self) -> None:
-        """Submit pending replication writes if bandwidth permits.
-
-        Called from the background drain thread.  Respects the
-        max-inflight and buffer-pressure limits.
-        """
-        if not self._replicated_chunks:
-            return
-        # Guard against drain thread running before __init__ finishes
-        # setting up the replication state.
-        if not hasattr(self, "_repl_inflight"):
-            return
-        if self._repl_inflight >= self._repl_max_inflight:
-            return
-
-        while (
-            self._repl_queue
-            and self._repl_inflight < self._repl_max_inflight
-        ):
-            key, memory_obj = self._repl_queue.popleft()
-
-            # Re-check: metadata may have changed since enqueue.
-            with self.disk_lock:
-                meta = self.dict.get(key)
-            if meta is None or meta.is_replicated:
-                memory_obj.ref_count_down()
-                continue
-
-            raw_tensor = memory_obj.raw_tensor
-            if raw_tensor is None:
-                # Buffer was freed; skip.
-                memory_obj.ref_count_down()
-                continue
-
-            self._submit_replication_write(key, memory_obj, raw_tensor)
-            self._repl_inflight += 1
-
-    def _submit_replication_write(
-        self,
-        key: CacheEngineKey,
-        memory_obj: MemoryObj,
-        raw_tensor: torch.Tensor,
-    ) -> None:
-        """Submit the actual replication write of sub-chunk B to NVMe.
-
-        Creates an ``_InflightGroup`` tagged with ``is_replication``
-        so that ``_drain_completed`` routes it to
-        ``_resolve_replication_group`` on completion.
-
-        Args:
-            key: The cache engine key.
-            memory_obj: CPU buffer (must stay alive until write completes).
-            raw_tensor: The raw flat uint8 tensor view.
-        """
-        nvme = self._nvme_tier
-        layer_start = self._repl_layer_start
-        layer_end = self._repl_layer_end
-        tier_layer_bytes = (
-            (layer_end - layer_start) * self._per_layer_bytes
-        )
-        tier_size = self._kv_size * tier_layer_bytes
-
-        # File path for the NVMe replica.
-        with self._repl_file_lock:
-            self._repl_file_counter += 1
-            repl_num = self._repl_file_counter
-        repl_path = os.path.join(
-            nvme.config.path,
-            key.to_string().replace("/", "-")
-            + f"_rep{repl_num}.bin",
-        )
-
-        repl_slice = _TierSlice(
-            tier_index=nvme.config.index,
-            path=repl_path,
-            layer_start=layer_start,
-            layer_end=layer_end,
-            size=tier_size,
-            k_file_offset=0,
-            v_file_offset=tier_layer_bytes,
-        )
-
-        sub_hashes: list[str] = []
-        for kv_idx in range(self._kv_size):
-            kv_label = "k" if kv_idx == 0 else "v"
-            io_hash = self._next_io_hash(
-                key, f"repl_{kv_label}"
-            )
-            buf_offset = (
-                kv_idx * self._kv_block_bytes
-                + layer_start * self._per_layer_bytes
-            )
-            raw_slice = raw_tensor[
-                buf_offset : buf_offset + tier_layer_bytes
-            ]
-            file_offset = kv_idx * tier_layer_bytes
-            nvme.engine.save(
-                io_hash, raw_slice, repl_path, file_offset
-            )
-            sub_hashes.append(io_hash)
-
-        # Create a tagged _InflightGroup for the drain thread.
-        repl_group = _InflightGroup(
-            key=key,
-            memory_obj=memory_obj,
-            remaining=len(sub_hashes),
-            total_size=tier_size,
-            shape=memory_obj.metadata.shape
-            if memory_obj.metadata else torch.Size([]),
-            dtype=memory_obj.metadata.dtype
-            if memory_obj.metadata else torch.float16,
-            fmt=memory_obj.metadata.fmt
-            if memory_obj.metadata else MemoryFormat.KV_BLOB,
-            cached_positions=None,
-            on_complete_callback=None,
-            io_hashes=sub_hashes,
-            tier_slices=[repl_slice],
-        )
-        repl_group.is_replication = True
-        for sh in sub_hashes:
-            self._hash_to_group[sh] = repl_group
-
-    def _resolve_replication_group(
-        self, group: _InflightGroup
-    ) -> None:
-        """Finalize a completed replication write.
-
-        Updates the chunk's metadata to add the NVMe replica slice
-        and releases the CPU buffer hold.
-
-        Args:
-            group: The completed replication inflight group.
-        """
-        self._repl_inflight -= 1
-        # Release the ref_count_up() from _maybe_enqueue_replication.
-        group.memory_obj.ref_count_down()
-
-        if group.tier_slices is None:
-            return
-
-        repl_slice = group.tier_slices[0]
-
-        # Add the replication slice to the existing metadata.
-        with self.disk_lock:
-            meta = self.dict.get(group.key)
-            if meta is None:
-                logger.warning(
-                    "KVStream replication: key %s disappeared "
-                    "from disk index before replication completed",
-                    group.key,
-                )
-                return
-            if meta.is_replicated:
-                # Another replication already completed; skip.
-                return
-            meta.slices.append(repl_slice)
-            meta.total_size += repl_slice.size
-            self.usage += repl_slice.size
-            self.stats_monitor.update_local_storage_usage(self.usage)
-
-        logger.debug(
-            "KVStream replication complete: key=%s, "
-            "replicated layers [%d,%d) to NVMe",
-            group.key,
-            repl_slice.layer_start,
-            repl_slice.layer_end,
-        )
 
     # ------------------------------------------------------------------ #
     #  Put (write) path — drain-based, P-tier layer-striped              #
@@ -1691,14 +1436,19 @@ class KVStreamDiskBackend(StorageBackendInterface):
             fmt = memory_obj.metadata.fmt
             cached_positions = memory_obj.metadata.cached_positions
 
-            # Build the inflight group for this chunk
+            # Build the inflight group for this chunk.
+            # replicated_chunks produces 2 write segments:
+            #   NVMe [0, num_layers) + PFS [repl_start, repl_end)
+            if self._replicated_chunks:
+                n_write_segments = 2
+            elif self._whole_chunk_placement:
+                n_write_segments = 1
+            else:
+                n_write_segments = num_tiers
             group = _InflightGroup(
                 key=key,
                 memory_obj=memory_obj,
-                remaining=self._kv_size * (
-                    1 if self._whole_chunk_placement
-                    else num_tiers
-                ),
+                remaining=self._kv_size * n_write_segments,
                 total_size=total_size,
                 shape=shape,
                 dtype=dtype,
@@ -1716,6 +1466,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
             need_prebuilt_slices = (
                 self._any_slab_enabled
                 or self._whole_chunk_placement
+                or self._replicated_chunks
             )
             slab_tier_slices: Optional[list[_TierSlice]] = (
                 [] if need_prebuilt_slices else None
@@ -1723,6 +1474,8 @@ class KVStreamDiskBackend(StorageBackendInterface):
 
             # In whole_chunk mode, pick ONE tier via weighted
             # round-robin; in layer_stripe mode, use all tiers.
+            # In replicated_chunks mode, build 3 write segments
+            # explicitly: NVMe [0, num_layers), PFS [repl, end).
             if self._whole_chunk_placement:
                 tier_idx = self._wc_pattern[
                     self._wc_counter % len(self._wc_pattern)
@@ -1732,62 +1485,137 @@ class KVStreamDiskBackend(StorageBackendInterface):
             else:
                 tiers_for_chunk = self._tiers
 
-            for tier in tiers_for_chunk:
-                tc = tier.config
-                tier_layer_bytes = tc.num_layers * self._per_layer_bytes
-                tier_size = self._kv_size * tier_layer_bytes
+            if self._replicated_chunks:
+                # Build 3 write segments explicitly:
+                #  seg 0: NVMe, layers [0, num_layers) — full copy
+                #  seg 1: PFS, layers [repl_start, repl_end) — tail
+                #  seg 2: (conceptual — seg 0 already covers it)
+                # Actually, NVMe writes ALL layers as a single file,
+                # and PFS writes only its portion.
+                write_segments: list[tuple[int, int, int]] = [
+                    # (tier_index, layer_start, layer_end)
+                    (self._nvme_tier_idx, 0, self._num_layers),
+                    (self._pfs_tier_idx,
+                     self._repl_layer_start,
+                     self._repl_layer_end),
+                ]
+            else:
+                write_segments = None  # use default tier loop
 
-                if tc.slab_size_mb > 0:
-                    path, slab_base = self._allocate_slab_space(
-                        tc.index, tier_size
+            if write_segments is not None:
+                # replicated_chunks explicit segment loop
+                for seg_tier_idx, seg_lstart, seg_lend in write_segments:
+                    tier = self._tiers[seg_tier_idx]
+                    tc = tier.config
+                    seg_num_layers = seg_lend - seg_lstart
+                    seg_layer_bytes = (
+                        seg_num_layers * self._per_layer_bytes
                     )
-                else:
+                    seg_size = self._kv_size * seg_layer_bytes
+
                     path = self._key_to_tier_path(key, tier)
-                    slab_base = 0
+                    # For replicated_chunks with NVMe full copy,
+                    # the NVMe file is larger than normal.  Use a
+                    # distinct path suffix for the full copy.
+                    if (
+                        seg_tier_idx == self._nvme_tier_idx
+                        and seg_lend == self._num_layers
+                        and seg_lstart == 0
+                    ):
+                        # NVMe full-copy file
+                        path = self._key_to_tier_path(key, tier)
 
-                # Pre-build tier slice (captures path and base offset
-                # at allocation time for slab tiers; file-per-chunk
-                # tiers get slab_base=0 which is correct).
-                if slab_tier_slices is not None:
-                    slab_tier_slices.append(
-                        _TierSlice(
-                            tier_index=tc.index,
-                            path=path,
-                            layer_start=tc.layer_start,
-                            layer_end=tc.layer_end,
-                            size=tier_size,
-                            k_file_offset=slab_base,
-                            v_file_offset=slab_base + tier_layer_bytes,
+                    slab_base = 0  # file-per-chunk only
+
+                    if slab_tier_slices is not None:
+                        slab_tier_slices.append(
+                            _TierSlice(
+                                tier_index=seg_tier_idx,
+                                path=path,
+                                layer_start=seg_lstart,
+                                layer_end=seg_lend,
+                                size=seg_size,
+                                k_file_offset=0,
+                                v_file_offset=seg_layer_bytes,
+                            )
                         )
-                    )
 
-                # For each KV component (K=0, V=1 for standard;
-                # just K=0 for MLA)
-                for kv_idx in range(self._kv_size):
-                    kv_label = "k" if kv_idx == 0 else "v"
-                    io_hash = self._next_io_hash(
-                        key, f"save_{kv_label}{tc.index}"
-                    )
-                    group.io_hashes.append(io_hash)
+                    for kv_idx in range(self._kv_size):
+                        kv_label = "k" if kv_idx == 0 else "v"
+                        io_hash = self._next_io_hash(
+                            key,
+                            f"save_{kv_label}_t{seg_tier_idx}"
+                            f"_l{seg_lstart}",
+                        )
+                        group.io_hashes.append(io_hash)
 
-                    # Byte offset within the raw buffer:
-                    #   kv_idx * kv_block_bytes + layer_start * per_layer
-                    buf_offset = (
-                        kv_idx * self._kv_block_bytes
-                        + tc.layer_start * self._per_layer_bytes
-                    )
-                    raw_slice = raw_tensor[
-                        buf_offset : buf_offset + tier_layer_bytes
-                    ]
+                        buf_offset = (
+                            kv_idx * self._kv_block_bytes
+                            + seg_lstart * self._per_layer_bytes
+                        )
+                        raw_slice = raw_tensor[
+                            buf_offset : buf_offset + seg_layer_bytes
+                        ]
+                        file_offset = kv_idx * seg_layer_bytes
 
-                    # File offset: for slab mode, base + kv component
-                    # offset; for file-per-chunk, K at 0, V at
-                    # tier_layer_bytes
-                    file_offset = slab_base + kv_idx * tier_layer_bytes
-
-                    save_ops.append(
-                        (tier.engine, io_hash, raw_slice, path, file_offset)
+                        save_ops.append((
+                            tier.engine, io_hash, raw_slice,
+                            path, file_offset,
+                        ))
+            else:
+                # layer_stripe / whole_chunk: original tier loop
+                for tier in tiers_for_chunk:
+                    tc = tier.config
+                    tier_layer_bytes = (
+                        tc.num_layers * self._per_layer_bytes
                     )
+                    tier_size = self._kv_size * tier_layer_bytes
+
+                    if tc.slab_size_mb > 0:
+                        path, slab_base = self._allocate_slab_space(
+                            tc.index, tier_size
+                        )
+                    else:
+                        path = self._key_to_tier_path(key, tier)
+                        slab_base = 0
+
+                    if slab_tier_slices is not None:
+                        slab_tier_slices.append(
+                            _TierSlice(
+                                tier_index=tc.index,
+                                path=path,
+                                layer_start=tc.layer_start,
+                                layer_end=tc.layer_end,
+                                size=tier_size,
+                                k_file_offset=slab_base,
+                                v_file_offset=(
+                                    slab_base + tier_layer_bytes
+                                ),
+                            )
+                        )
+
+                    for kv_idx in range(self._kv_size):
+                        kv_label = "k" if kv_idx == 0 else "v"
+                        io_hash = self._next_io_hash(
+                            key, f"save_{kv_label}{tc.index}"
+                        )
+                        group.io_hashes.append(io_hash)
+
+                        buf_offset = (
+                            kv_idx * self._kv_block_bytes
+                            + tc.layer_start * self._per_layer_bytes
+                        )
+                        raw_slice = raw_tensor[
+                            buf_offset : buf_offset + tier_layer_bytes
+                        ]
+                        file_offset = (
+                            slab_base + kv_idx * tier_layer_bytes
+                        )
+
+                        save_ops.append((
+                            tier.engine, io_hash, raw_slice,
+                            path, file_offset,
+                        ))
 
             group.tier_slices = slab_tier_slices
 
@@ -1886,83 +1714,6 @@ class KVStreamDiskBackend(StorageBackendInterface):
     # ------------------------------------------------------------------ #
 
     @_lmcache_nvtx_annotate
-    def _submit_static_loads(
-        self,
-        key: CacheEngineKey,
-        meta: _TieredChunkMeta,
-        raw_tensor: torch.Tensor,
-    ) -> list[tuple[_TierState, str]]:
-        """Submit only the non-stealable reads for a replicated chunk.
-
-        For ``replicated_chunks``, this submits sub-chunk A (NVMe-
-        exclusive layers) and sub-chunk B from PFS for non-replicated
-        chunks.  Replicated sub-chunk-B reads are deferred to the
-        work-stealing scheduler.
-
-        Args:
-            key: The cache engine key.
-            meta: Tiered metadata for this key.
-            raw_tensor: Destination buffer (flat uint8).
-
-        Returns:
-            List of ``(tier, io_hash)`` tuples for the submitted reads.
-        """
-        load_refs: list[tuple[_TierState, str]] = []
-
-        for tier_slice in meta.slices:
-            # Skip the NVMe replica of sub-chunk B; that will be
-            # handled by the work-stealing scheduler.
-            if (
-                tier_slice.tier_index == self._nvme_tier.config.index
-                and tier_slice.layer_start == self._repl_layer_start
-                and tier_slice.layer_end == self._repl_layer_end
-            ):
-                continue
-            # Also skip the PFS original of sub-chunk B for
-            # replicated chunks — it goes to work-stealing too.
-            if (
-                tier_slice.tier_index != self._nvme_tier.config.index
-                and tier_slice.layer_start == self._repl_layer_start
-                and tier_slice.layer_end == self._repl_layer_end
-                and meta.is_replicated
-            ):
-                continue
-
-            tier = self._tiers[tier_slice.tier_index]
-            tier_layer_bytes = (
-                (tier_slice.layer_end - tier_slice.layer_start)
-                * self._per_layer_bytes
-            )
-
-            for kv_idx in range(self._kv_size):
-                kv_label = "k" if kv_idx == 0 else "v"
-                io_hash = self._next_io_hash(
-                    key,
-                    f"load_{kv_label}{tier_slice.tier_index}",
-                )
-                buf_offset = (
-                    kv_idx * self._kv_block_bytes
-                    + tier_slice.layer_start
-                    * self._per_layer_bytes
-                )
-                raw_slice = raw_tensor[
-                    buf_offset : buf_offset + tier_layer_bytes
-                ]
-                file_offset = kv_idx * tier_layer_bytes
-                torch.cuda.nvtx.range_push(
-                    f"kvs_load_t{tier_slice.tier_index}_{kv_label}"
-                )
-                tier.engine.load(
-                    io_hash,
-                    raw_slice,
-                    tier_slice.path,
-                    file_offset,
-                )
-                torch.cuda.nvtx.range_pop()
-                load_refs.append((tier, io_hash))
-
-        return load_refs
-
     def _submit_tiered_loads(
         self,
         key: CacheEngineKey,
@@ -2018,243 +1769,260 @@ class KVStreamDiskBackend(StorageBackendInterface):
         return load_refs
 
     # ------------------------------------------------------------------ #
-    #  Work-stealing scheduler for replicated sub-chunk-B reads            #
+    #  replicated_chunks: submit exclusive-only loads                     #
+    # ------------------------------------------------------------------ #
+
+    def _submit_exclusive_loads(
+        self,
+        key: CacheEngineKey,
+        meta: _TieredChunkMeta,
+        raw_tensor: torch.Tensor,
+    ) -> list[tuple[_TierState, str]]:
+        """Submit reads for the NVMe-exclusive layer range only.
+
+        In ``replicated_chunks`` mode, layers [0, repl_layer_start)
+        exist only on NVMe.  This submits K+V reads for that range.
+        The replicated range [repl_layer_start, repl_layer_end) is
+        handled by the work-stealing scheduler.
+
+        Args:
+            key: Cache engine key.
+            meta: Tiered metadata (with 2 slices: NVMe full + PFS tail).
+            raw_tensor: Destination buffer (flat uint8).
+
+        Returns:
+            List of ``(tier, io_hash)`` for the submitted reads.
+        """
+        load_refs: list[tuple[_TierState, str]] = []
+        nvme_tier = self._tiers[self._nvme_tier_idx]
+
+        # Find the NVMe slice (layer_start=0, layer_end=num_layers)
+        nvme_slice: Optional[_TierSlice] = None
+        for s in meta.slices:
+            if s.tier_index == self._nvme_tier_idx and s.layer_start == 0:
+                nvme_slice = s
+                break
+        assert nvme_slice is not None, (
+            "replicated_chunks: NVMe slice not found in metadata"
+        )
+
+        # Read only the exclusive portion [0, repl_layer_start)
+        excl_layers = self._repl_layer_start
+        excl_layer_bytes = excl_layers * self._per_layer_bytes
+
+        for kv_idx in range(self._kv_size):
+            kv_label = "k" if kv_idx == 0 else "v"
+            io_hash = self._next_io_hash(
+                key, f"load_{kv_label}_excl"
+            )
+            buf_offset = (
+                kv_idx * self._kv_block_bytes
+                # layer_start = 0, so no offset from layer_start
+            )
+            raw_slice = raw_tensor[
+                buf_offset : buf_offset + excl_layer_bytes
+            ]
+            # File offset: NVMe file has ALL layers.
+            # K-block at k_file_offset, V-block at v_file_offset.
+            # Within each block, layers are contiguous from 0.
+            # Exclusive layers are [0, repl_layer_start), which is
+            # the first excl_layer_bytes of the K/V block.
+            if kv_idx == 0:
+                file_offset = nvme_slice.k_file_offset
+            else:
+                file_offset = nvme_slice.v_file_offset
+
+            nvme_tier.engine.load(
+                io_hash, raw_slice, nvme_slice.path, file_offset
+            )
+            load_refs.append((nvme_tier, io_hash))
+
+        return load_refs
+
+    # ------------------------------------------------------------------ #
+    #  replicated_chunks: work-stealing scheduler                        #
     # ------------------------------------------------------------------ #
 
     def _init_work_stealing(
         self,
-        steal_pool: list[
-            tuple[str, CacheEngineKey, MemoryObj,
-                  _TieredChunkMeta, torch.Tensor, int, int]
-        ],
+        steal_pool: list[tuple],
     ) -> None:
-        """Initialize the per-step work-stealing state.
-
-        Submits the first batch of steal reads (``steal_batch_size``
-        from each tier end).
+        """Initialize per-step work-stealing and submit first batches.
 
         Args:
-            steal_pool: List of ``(group_hash, key, memory_obj, meta,
-                raw_tensor, sub_b_layer_start, sub_b_layer_end)`` for
-                replicated chunks whose sub-chunk-B is stealable.
+            steal_pool: List of
+                ``(group_hash, key, meta, raw_tensor,
+                  repl_layer_start, repl_layer_end)``
+                for chunks whose replicated range is stealable.
         """
         ws = _WorkStealState(
             items=steal_pool,
             pfs_cursor=len(steal_pool) - 1,
-            max_inflight_per_tier=self._repl_steal_batch,
+            max_inflight_per_tier=self._steal_batch,
         )
         self._work_steal_state = ws
-
-        # Submit initial batches from each end.
-        self._submit_next_steal_batch(tier_idx=0)  # NVMe from front
-        self._submit_next_steal_batch(
-            tier_idx=self._tiers[1].config.index
-        )  # PFS from back
+        self._submit_next_steal_batch(self._nvme_tier_idx)
+        self._submit_next_steal_batch(self._pfs_tier_idx)
 
     def _submit_next_steal_batch(self, tier_idx: int) -> None:
-        """Advance the cursor and submit steal reads for one tier.
-
-        NVMe (tier 0) reads from the front; PFS (tier >= 1) reads
-        from the back.
-
-        Args:
-            tier_idx: The tier index to submit reads for.
-        """
+        """Advance cursor and submit steal reads for one tier."""
         ws = self._work_steal_state
         if ws is None:
             return
-
-        is_nvme = tier_idx == self._nvme_tier.config.index
+        is_nvme = tier_idx == self._nvme_tier_idx
 
         if is_nvme:
-            inflight = ws.nvme_inflight
-            max_inf = ws.max_inflight_per_tier
-            while inflight < max_inf and ws.nvme_cursor <= ws.pfs_cursor:
+            while (
+                ws.nvme_inflight < ws.max_inflight_per_tier
+                and ws.nvme_cursor <= ws.pfs_cursor
+            ):
                 idx = ws.nvme_cursor
                 ws.nvme_cursor += 1
-                if idx in ws.completed_items:
+                if idx in ws.done_items:
                     continue
                 if self._submit_steal_read(idx, tier_idx):
-                    inflight += 1
-            ws.nvme_inflight = inflight
-        else:
-            inflight = ws.pfs_inflight
-            max_inf = ws.max_inflight_per_tier
-            while inflight < max_inf and ws.pfs_cursor >= ws.nvme_cursor:
-                idx = ws.pfs_cursor
-                ws.pfs_cursor -= 1
-                if idx in ws.completed_items:
-                    continue
-                if self._submit_steal_read(idx, tier_idx):
-                    inflight += 1
-            ws.pfs_inflight = inflight
+                    ws.nvme_inflight += 1
+            return
+
+        # PFS: from the back
+        while (
+            ws.pfs_inflight < ws.max_inflight_per_tier
+            and ws.pfs_cursor >= ws.nvme_cursor
+        ):
+            idx = ws.pfs_cursor
+            ws.pfs_cursor -= 1
+            if idx in ws.done_items:
+                continue
+            if self._submit_steal_read(idx, tier_idx):
+                ws.pfs_inflight += 1
 
     def _submit_steal_read(
         self, item_idx: int, tier_idx: int
     ) -> bool:
-        """Submit a single steal read for sub-chunk B on a given tier.
-
-        Args:
-            item_idx: Index into ``_WorkStealState.items``.
-            tier_idx: Which tier to read from.
+        """Submit K+V reads for one item's replicated range on one tier.
 
         Returns:
-            ``True`` if reads were successfully submitted,
-            ``False`` if no matching slice was found.
+            True if reads were submitted, False on failure.
         """
         ws = self._work_steal_state
         assert ws is not None
-        (
-            group_hash, key, memory_obj, meta,
-            raw_tensor, layer_start, layer_end,
-        ) = ws.items[item_idx]
+        group_hash, key, meta, raw_tensor, l_start, l_end = (
+            ws.items[item_idx]
+        )
 
-        # Find the _TierSlice for sub-chunk B on the requested tier.
-        target_slice: Optional[_TierSlice] = None
+        # Find the slice for this tier covering [l_start, l_end)
+        target: Optional[_TierSlice] = None
         for s in meta.slices:
             if (
                 s.tier_index == tier_idx
-                and s.layer_start == layer_start
-                and s.layer_end == layer_end
+                and s.layer_start <= l_start
+                and s.layer_end >= l_end
             ):
-                target_slice = s
+                target = s
                 break
-
-        if target_slice is None:
-            logger.warning(
-                "KVStream work-steal: no slice for tier %d "
-                "layers [%d,%d) key=%s",
-                tier_idx, layer_start, layer_end, key,
-            )
+        if target is None:
             return False
 
-        tier_state = self._tiers[tier_idx]
-        tier_layer_bytes = (
-            (layer_end - layer_start) * self._per_layer_bytes
-        )
+        tier = self._tiers[tier_idx]
+        repl_layer_bytes = (l_end - l_start) * self._per_layer_bytes
 
         for kv_idx in range(self._kv_size):
             kv_label = "k" if kv_idx == 0 else "v"
             io_hash = self._next_io_hash(
                 key, f"steal_{kv_label}_t{tier_idx}"
             )
+            # Buffer offset: replicated layers start at l_start
             buf_offset = (
                 kv_idx * self._kv_block_bytes
-                + layer_start * self._per_layer_bytes
+                + l_start * self._per_layer_bytes
             )
             raw_slice = raw_tensor[
-                buf_offset : buf_offset + tier_layer_bytes
+                buf_offset : buf_offset + repl_layer_bytes
             ]
-            file_offset = (
-                target_slice.k_file_offset
-                if kv_idx == 0
-                else target_slice.v_file_offset
+            # File offset: within this tier's file, the replicated
+            # layers are at an offset relative to the slice's start.
+            layer_offset_in_slice = (
+                (l_start - target.layer_start)
+                * self._per_layer_bytes
             )
+            if kv_idx == 0:
+                file_offset = (
+                    target.k_file_offset + layer_offset_in_slice
+                )
+            else:
+                file_offset = (
+                    target.v_file_offset + layer_offset_in_slice
+                )
 
-            tier_state.engine.load(
-                io_hash, raw_slice, target_slice.path,
-                file_offset,
+            tier.engine.load(
+                io_hash, raw_slice, target.path, file_offset
             )
-
             self._sub_to_group[io_hash] = group_hash
             self._sub_to_tier_idx[io_hash] = tier_idx
             self._tier_pending_subs[tier_idx] += 1
-            ws.sub_to_item_idx[io_hash] = item_idx
+            ws.sub_to_item[io_hash] = item_idx
 
         return True
 
     def _pump_work_stealing(
         self, completed_sub_hashes: list[str]
-    ) -> None:
-        """Process steal completions and submit next batches.
+    ) -> list[str]:
+        """Process steal completions, replenish batches.
 
-        When a steal sub-hash completes, its parent item tracks the
-        sub-completion count.  Once all ``kv_size`` sub-hashes for
-        an item have completed (from ANY tier), the item is marked
-        done and the group pending count is decremented.  Later
-        completions from the other tier are harmless (same data
-        overwrites same buffer region).
-
-        Note: This method does NOT pop from ``sub_to_item_idx`` —
-        ``_process_sub_completions`` uses that mapping to identify
-        steal sub-hashes and skip its own decrement.
-
-        Args:
-            completed_sub_hashes: Sub-hashes that just completed.
+        Returns list of steal sub-hashes that were processed (so
+        ``_process_sub_completions`` can skip them).
         """
         ws = self._work_steal_state
         if ws is None:
-            return
+            return []
 
+        processed: list[str] = []
         nvme_items_done = 0
         pfs_items_done = 0
 
         for sub_hash in completed_sub_hashes:
-            # Use .get() — do NOT pop; _process_sub_completions
-            # needs the entry to identify steal sub-hashes.
-            item_idx = ws.sub_to_item_idx.get(sub_hash)
+            item_idx = ws.sub_to_item.get(sub_hash)
             if item_idx is None:
                 continue  # not a steal sub-hash
+            processed.append(sub_hash)
 
-            if item_idx in ws.item_steal_done:
-                # Item already fully completed by another tier's
-                # K+V pair.  This is a late arrival — harmless
-                # overwrite of identical data.
+            if item_idx in ws.done_items:
+                # Late arrival from the other tier — harmless.
                 continue
 
-            # Accumulate per-item sub-completions.
-            count = ws.item_sub_completions.get(item_idx, 0) + 1
-            ws.item_sub_completions[item_idx] = count
-
+            count = ws.item_completions.get(item_idx, 0) + 1
+            ws.item_completions[item_idx] = count
             if count < self._kv_size:
-                # K arrived but V hasn't (or vice versa).  Don't
-                # mark the item done yet.
-                continue
+                continue  # K arrived but V hasn't (or vice versa)
 
-            # All kv_size sub-hashes for this item are complete.
-            ws.completed_items.add(item_idx)
-            ws.item_steal_done.add(item_idx)
+            # Item done (K+V complete from some tier).
+            ws.done_items.add(item_idx)
 
-            # Determine which tier completed it for inflight
+            # Figure out which tier completed it for inflight
             # accounting.
             tier_idx = self._sub_to_tier_idx.get(sub_hash)
-            is_nvme = (
-                tier_idx is not None
-                and tier_idx == self._nvme_tier.config.index
-            )
-            if is_nvme:
+            if tier_idx == self._nvme_tier_idx:
                 nvme_items_done += 1
             else:
                 pfs_items_done += 1
 
-            # Decrement the parent group's pending count.
+            # Decrement group pending count.
             group_hash = self._sub_to_group.get(sub_hash)
-            if (
-                group_hash
-                and group_hash in self._group_pending_count
-            ):
+            if group_hash and group_hash in self._group_pending_count:
                 self._group_pending_count[group_hash] -= (
                     self._kv_size
                 )
 
-        # Replenish: decrement inflight counters and submit more.
         ws.nvme_inflight = max(
             0, ws.nvme_inflight - nvme_items_done
         )
         ws.pfs_inflight = max(
             0, ws.pfs_inflight - pfs_items_done
         )
+        self._submit_next_steal_batch(self._nvme_tier_idx)
+        self._submit_next_steal_batch(self._pfs_tier_idx)
 
-        self._submit_next_steal_batch(
-            tier_idx=self._nvme_tier.config.index
-        )
-        self._submit_next_steal_batch(
-            tier_idx=self._tiers[1].config.index
-        )
-
-    # ------------------------------------------------------------------ #
-    #  Blocking read path                                                  #
-    # ------------------------------------------------------------------ #
+        return processed
 
     @_lmcache_nvtx_annotate
     def get_blocking(
@@ -2434,10 +2202,6 @@ class KVStreamDiskBackend(StorageBackendInterface):
         and returns immediately.  The returned ``io_hash`` is a
         synthetic group hash that can be passed to ``wait_one_load``.
 
-        In ``replicated_chunks`` mode, replicated chunks have their
-        sub-chunk-B reads deferred to a work-stealing scheduler that
-        is pumped from ``wait_any_load``.
-
         Args:
             keys: Ordered list of cache keys to load.
 
@@ -2448,13 +2212,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
         results: List[
             Optional[tuple[str, CacheEngineKey, MemoryObj]]
         ] = []
-        # Track (group_hash -> list of (tier, io_hash)) for wait_one
-
-        # Collect replicated chunks for work-stealing.
-        steal_pool: list[
-            tuple[str, CacheEngineKey, MemoryObj,
-                  _TieredChunkMeta, torch.Tensor, int, int]
-        ] = []
+        steal_pool: list[tuple] = []
 
         for key in keys:
             with self.disk_lock:
@@ -2463,26 +2221,12 @@ class KVStreamDiskBackend(StorageBackendInterface):
                     continue
                 self.cache_policy.update_on_hit(key, self.dict)
                 meta: _TieredChunkMeta = self.dict[key]
-                # Snapshot slices under lock — the drain thread may
-                # append a replication slice concurrently.
-                slices_snapshot = list(meta.slices)
-                is_repl = meta.is_replicated
                 shape = meta.shape
                 dtype = meta.dtype
                 fmt = meta.fmt
 
             assert dtype is not None
             assert shape is not None
-
-            # Build a lightweight snapshot meta for the submit
-            # functions so they don't reference the live meta.slices.
-            snap_meta = _TieredChunkMeta(
-                slices=slices_snapshot,
-                total_size=meta.total_size,
-                shape=shape,
-                dtype=dtype,
-                fmt=fmt,
-            )
 
             memory_obj = self.local_cpu_backend.allocate(
                 shape, dtype, fmt
@@ -2495,23 +2239,16 @@ class KVStreamDiskBackend(StorageBackendInterface):
             raw_tensor = memory_obj.raw_tensor
             assert raw_tensor is not None
 
-            # Create a synthetic group hash for the caller
             group_hash = self._next_io_hash(key, "load_group")
 
-            if (
-                self._replicated_chunks
-                and is_repl
-            ):
-                # Replicated chunk: submit only the static reads
-                # (sub-chunk A from NVMe).  Sub-chunk B is deferred
-                # to work-stealing.
-                load_refs = self._submit_static_loads(
-                    key, snap_meta, raw_tensor
+            if self._replicated_chunks:
+                # Submit only the NVMe-exclusive layers.  The
+                # replicated range goes through work-stealing.
+                load_refs = self._submit_exclusive_loads(
+                    key, meta, raw_tensor
                 )
                 self._overlapped_load_refs[group_hash] = load_refs
-
-                # Pending count = static reads + kv_size (for
-                # the steal-able sub-chunk B K+V).
+                # pending = exclusive K+V + replicated K+V
                 self._group_pending_count[group_hash] = (
                     len(load_refs) + self._kv_size
                 )
@@ -2523,15 +2260,13 @@ class KVStreamDiskBackend(StorageBackendInterface):
                     self._tier_pending_subs[tier_idx] += 1
 
                 steal_pool.append((
-                    group_hash, key, memory_obj, snap_meta,
-                    raw_tensor,
+                    group_hash, key, meta, raw_tensor,
                     self._repl_layer_start,
                     self._repl_layer_end,
                 ))
             else:
-                # Non-replicated: submit all tier reads immediately.
                 load_refs = self._submit_tiered_loads(
-                    key, snap_meta, raw_tensor
+                    key, meta, raw_tensor
                 )
                 self._overlapped_load_refs[group_hash] = load_refs
                 self._group_pending_count[group_hash] = len(
@@ -2544,24 +2279,11 @@ class KVStreamDiskBackend(StorageBackendInterface):
                     self._sub_to_tier_idx[sub_hash] = tier_idx
                     self._tier_pending_subs[tier_idx] += 1
 
-            # Promote into CPU hot_cache immediately so the
-            # LRU insertion order matches the deterministic key
-            # order.  ref_count goes 1→2, making the entry
-            # non-evictable while the io_uring read is in-flight.
-            # The caller's later ref_count_down() will drop it
-            # to 1, leaving it evictable in hot_cache.
             self.local_cpu_backend.submit_put_task(key, memory_obj)
-
             results.append((group_hash, key, memory_obj))
 
-        # Initialize work-stealing scheduler for replicated chunks.
         if steal_pool:
             self._init_work_stealing(steal_pool)
-
-        # NOTE: replication for non-replicated chunks read from disk
-        # is triggered in _process_sub_completions after the group is
-        # fully resolved (all I/O complete, buffer has valid data).
-        # Do NOT trigger it here — the buffers haven't been read yet.
 
         return results
 
@@ -2605,9 +2327,9 @@ class KVStreamDiskBackend(StorageBackendInterface):
         its parent group.  When a group reaches zero, its metadata is
         finalised and the group is yielded as ready.
 
-        Work-steal sub-hashes are handled by ``_pump_work_stealing``
-        (which adjusts group pending counts directly); this method
-        skips them but still checks if their parent group is now ready.
+        Steal sub-hashes (from work-stealing) are handled by
+        ``_pump_work_stealing`` first; this method then cleans up
+        their tracking entries.
 
         Args:
             sub_hashes: Sub-hashes that just completed.
@@ -2616,64 +2338,47 @@ class KVStreamDiskBackend(StorageBackendInterface):
             List of ``(group_hash, key, memory_obj)`` for chunks whose
             I/O across all tiers is now complete.
         """
-        # If work-stealing is active, pump it first so that steal
-        # sub-hashes get their group pending counts decremented and
-        # inflight slots replenished.
-        ws = getattr(self, "_work_steal_state", None)
-        if ws is not None:
-            self._pump_work_stealing(sub_hashes)
+        # Let work-stealing process its sub-hashes first (adjusts
+        # group pending counts and replenishes batches).
+        steal_set: set[str] = set()
+        if self._work_steal_state is not None:
+            steal_set = set(
+                self._pump_work_stealing(sub_hashes)
+            )
 
         ready: list[tuple[str, CacheEngineKey, MemoryObj]] = []
         for sub_hash in sub_hashes:
-            # Check if this is a steal sub-hash (already handled by
-            # _pump_work_stealing).
-            is_steal = (
-                ws is not None
-                and sub_hash in ws.sub_to_item_idx
-            )
+            is_steal = sub_hash in steal_set
 
-            if not is_steal:
-                # Decrement per-tier pending counter
-                tier_idx = self._sub_to_tier_idx.pop(
-                    sub_hash, None
-                )
-                if tier_idx is not None:
-                    self._tier_pending_subs[tier_idx] -= 1
+            # Always clean up tier tracking.
+            tier_idx = self._sub_to_tier_idx.pop(sub_hash, None)
+            if tier_idx is not None:
+                self._tier_pending_subs[tier_idx] -= 1
 
-                group_hash = self._sub_to_group.pop(
-                    sub_hash, None
-                )
-                if group_hash is None:
-                    continue
-                remaining = self._group_pending_count[group_hash] - 1
-                if remaining > 0:
-                    self._group_pending_count[group_hash] = remaining
-                    continue
-            else:
+            group_hash = self._sub_to_group.pop(sub_hash, None)
+            if group_hash is None:
+                continue
+
+            if is_steal:
                 # Steal sub-hash: _pump_work_stealing already
-                # decremented the group pending count.  Just clean
-                # up tracking structures.
-                tier_idx = self._sub_to_tier_idx.pop(
-                    sub_hash, None
-                )
-                if tier_idx is not None:
-                    self._tier_pending_subs[tier_idx] -= 1
-                group_hash = self._sub_to_group.pop(
-                    sub_hash, None
-                )
-                if group_hash is None:
-                    continue
-                # When multiple steal sub-hashes (K+V) for the
-                # same group complete in the same drain batch,
-                # the first one resolves the group.  Subsequent
-                # ones find it already deleted — skip them.
+                # adjusted group pending count.  Check if group
+                # is ready (may have been resolved by a prior
+                # steal sub-hash in this same batch).
                 if group_hash not in self._group_pending_count:
                     continue
                 remaining = self._group_pending_count[group_hash]
                 if remaining > 0:
                     continue
+            else:
+                # Normal sub-hash: decrement group pending count.
+                remaining = (
+                    self._group_pending_count[group_hash] - 1
+                )
+                if remaining > 0:
+                    self._group_pending_count[group_hash] = remaining
+                    continue
 
-            # All sub-hashes for this group are done
+            # All sub-hashes for this group are done.
             del self._group_pending_count[group_hash]
             key, memory_obj = self._group_meta.pop(group_hash)
             self._overlapped_load_refs.pop(group_hash, None)
@@ -2684,13 +2389,6 @@ class KVStreamDiskBackend(StorageBackendInterface):
                     disk_meta.cached_positions
                 )
             ready.append((group_hash, key, memory_obj))
-
-            # Trigger replication for non-replicated chunks that
-            # were just read from disk.  The buffer now has valid
-            # data (all io_uring reads complete).
-            if self._replicated_chunks:
-                self._maybe_enqueue_replication(key, memory_obj)
-
         return ready
 
     @_lmcache_nvtx_annotate
@@ -2759,10 +2457,9 @@ class KVStreamDiskBackend(StorageBackendInterface):
             # the other tier's sub-hashes still pending), loop back
             # to drain all tiers again.
 
-        # Clean up work-stealing state if all steal items are done.
+        # Clean up work-stealing state when all groups are resolved.
         if (
-            self._replicated_chunks
-            and self._work_steal_state is not None
+            self._work_steal_state is not None
             and not self._group_pending_count
         ):
             self._work_steal_state = None
