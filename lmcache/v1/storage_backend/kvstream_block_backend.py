@@ -1058,7 +1058,7 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         assert raw_tensor is not None
 
         torch.cuda.nvtx.range_push(
-            f"kvs_load_t{tier_idx}_{key.chunk_hash[:8]}"
+            f"kvs_load_t{tier_idx}_{key.chunk_hash_hex[:8]}"
         )
         self._tier_engines[tier_idx].load(
             io_hash, raw_tensor, path, 0
