@@ -221,6 +221,10 @@ class _WorkStealState:
     item_completions: dict[int, int] = field(default_factory=dict)
     # items fully resolved (first tier to complete kv_size wins)
     done_items: set[int] = field(default_factory=set)
+    # Track which items each tier has already submitted reads for,
+    # to avoid double-submission when NVMe re-steals PFS items.
+    nvme_submitted: set[int] = field(default_factory=set)
+    pfs_submitted: set[int] = field(default_factory=set)
 
 
 # ======================================================================== #
@@ -765,6 +769,12 @@ class KVStreamDiskBackend(StorageBackendInterface):
             self._steal_batch: int = int(
                 extra.get("kvstream_steal_batch_size", 2)
             )
+            self._pfs_max_pending_steals: int = int(
+                extra.get("kvstream_pfs_max_pending_steals", 4)
+            )
+            # Persistent cross-step set of PFS steal sub-hashes
+            # that were submitted but haven't completed yet.
+            self._pfs_steal_pending: set[str] = set()
             # NVMe = tier 0, PFS = tier 1.
             # NVMe-exclusive layer range: layers that ONLY NVMe has.
             # Replicated layer range: layers on BOTH NVMe and PFS.
@@ -784,9 +794,11 @@ class KVStreamDiskBackend(StorageBackendInterface):
             )
             logger.info(
                 "KVStream replicated_chunks: steal_batch=%d, "
+                "pfs_max_pending=%d, "
                 "exclusive_layers=[%d,%d), "
                 "replicated_layers=[%d,%d)",
                 self._steal_batch,
+                self._pfs_max_pending_steals,
                 self._excl_layer_start,
                 self._excl_layer_end,
                 self._repl_layer_start,
@@ -1866,13 +1878,20 @@ class KVStreamDiskBackend(StorageBackendInterface):
         self._submit_next_steal_batch(self._pfs_tier_idx)
 
     def _submit_next_steal_batch(self, tier_idx: int) -> None:
-        """Advance cursor and submit steal reads for one tier."""
+        """Advance cursor and submit steal reads for one tier.
+
+        For NVMe, after the normal cursor range is exhausted, any
+        remaining undone items (including those PFS is working on)
+        are also submitted on NVMe.  This provides full tail-latency
+        immunity — NVMe can complete all items even if PFS stalls.
+        """
         ws = self._work_steal_state
         if ws is None:
             return
         is_nvme = tier_idx == self._nvme_tier_idx
 
         if is_nvme:
+            # Phase 1: normal cursor-based stealing from the front.
             while (
                 ws.nvme_inflight < ws.max_inflight_per_tier
                 and ws.nvme_cursor <= ws.pfs_cursor
@@ -1881,11 +1900,35 @@ class KVStreamDiskBackend(StorageBackendInterface):
                 ws.nvme_cursor += 1
                 if idx in ws.done_items:
                     continue
+                if idx in ws.nvme_submitted:
+                    continue
                 if self._submit_steal_read(idx, tier_idx):
+                    ws.nvme_submitted.add(idx)
                     ws.nvme_inflight += 1
+
+            # Phase 2: re-steal PFS's items that haven't completed.
+            # Scan all items beyond the cursor range (PFS territory)
+            # and submit NVMe reads for any that are undone and not
+            # yet submitted to NVMe.
+            if ws.nvme_inflight < ws.max_inflight_per_tier:
+                for idx in range(len(ws.items)):
+                    if ws.nvme_inflight >= ws.max_inflight_per_tier:
+                        break
+                    if idx in ws.done_items:
+                        continue
+                    if idx in ws.nvme_submitted:
+                        continue
+                    if self._submit_steal_read(idx, tier_idx):
+                        ws.nvme_submitted.add(idx)
+                        ws.nvme_inflight += 1
             return
 
-        # PFS: from the back
+        # PFS: from the back, normal cursor-based only.
+        # Skip if PFS has too many unresolved steal reads from
+        # this or previous steps (tail spike backlog).
+        if len(self._pfs_steal_pending) >= self._pfs_max_pending_steals:
+            return
+
         while (
             ws.pfs_inflight < ws.max_inflight_per_tier
             and ws.pfs_cursor >= ws.nvme_cursor
@@ -1894,7 +1937,10 @@ class KVStreamDiskBackend(StorageBackendInterface):
             ws.pfs_cursor -= 1
             if idx in ws.done_items:
                 continue
+            if idx in ws.pfs_submitted:
+                continue
             if self._submit_steal_read(idx, tier_idx):
+                ws.pfs_submitted.add(idx)
                 ws.pfs_inflight += 1
 
     def _submit_steal_read(
@@ -1963,6 +2009,11 @@ class KVStreamDiskBackend(StorageBackendInterface):
             self._tier_pending_subs[tier_idx] += 1
             ws.sub_to_item[io_hash] = item_idx
 
+            # Track PFS steal sub-hashes across steps so we can
+            # detect PFS backlog and bench it.
+            if tier_idx == self._pfs_tier_idx:
+                self._pfs_steal_pending.add(io_hash)
+
         return True
 
     def _pump_work_stealing(
@@ -1981,6 +2032,10 @@ class KVStreamDiskBackend(StorageBackendInterface):
         nvme_items_done = 0
         pfs_items_done = 0
 
+        # Track late-arrival tier decrements separately.
+        nvme_late = 0
+        pfs_late = 0
+
         for sub_hash in completed_sub_hashes:
             item_idx = ws.sub_to_item.get(sub_hash)
             if item_idx is None:
@@ -1988,7 +2043,24 @@ class KVStreamDiskBackend(StorageBackendInterface):
             processed.append(sub_hash)
 
             if item_idx in ws.done_items:
-                # Late arrival from the other tier — harmless.
+                # Late arrival from the other tier — harmless
+                # overwrite of identical data.  But we need to
+                # account for inflight on the late tier so it
+                # can submit more work.
+                late_tier = self._sub_to_tier_idx.get(sub_hash)
+                # Only count once per item per tier (kv_size
+                # sub-hashes per item, count on the last one).
+                late_count = ws.item_completions.get(
+                    item_idx, 0
+                ) + 1
+                ws.item_completions[item_idx] = late_count
+                # After kv_size *additional* late arrivals, the
+                # other tier's pair is fully done.
+                if late_count % self._kv_size == 0:
+                    if late_tier == self._nvme_tier_idx:
+                        nvme_late += 1
+                    else:
+                        pfs_late += 1
                 continue
 
             count = ws.item_completions.get(item_idx, 0) + 1
@@ -2015,10 +2087,10 @@ class KVStreamDiskBackend(StorageBackendInterface):
                 )
 
         ws.nvme_inflight = max(
-            0, ws.nvme_inflight - nvme_items_done
+            0, ws.nvme_inflight - nvme_items_done - nvme_late
         )
         ws.pfs_inflight = max(
-            0, ws.pfs_inflight - pfs_items_done
+            0, ws.pfs_inflight - pfs_items_done - pfs_late
         )
         self._submit_next_steal_batch(self._nvme_tier_idx)
         self._submit_next_steal_batch(self._pfs_tier_idx)
@@ -2343,6 +2415,13 @@ class KVStreamDiskBackend(StorageBackendInterface):
             List of ``(group_hash, key, memory_obj)`` for chunks whose
             I/O across all tiers is now complete.
         """
+        # Drain PFS steal completions (current step or stale from
+        # previous steps).  This must happen before work-stealing
+        # processing so the PFS backlog counter is accurate.
+        if self._replicated_chunks and self._pfs_steal_pending:
+            for sub_hash in sub_hashes:
+                self._pfs_steal_pending.discard(sub_hash)
+
         # Let work-stealing process its sub-hashes first (adjusts
         # group pending counts and replenishes batches).
         steal_set: set[str] = set()
