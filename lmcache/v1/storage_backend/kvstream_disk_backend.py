@@ -2558,19 +2558,10 @@ class KVStreamDiskBackend(StorageBackendInterface):
         if steal_pool:
             self._init_work_stealing(steal_pool)
 
-        # Trigger replication for non-replicated chunks being read.
-        if self._replicated_chunks:
-            for key in keys:
-                with self.disk_lock:
-                    meta = self.dict.get(key)
-                if meta is not None and not meta.is_replicated:
-                    # Find the memory_obj for this key from results
-                    for r in results:
-                        if r is not None and r[1] == key:
-                            self._maybe_enqueue_replication(
-                                key, r[2]
-                            )
-                            break
+        # NOTE: replication for non-replicated chunks read from disk
+        # is triggered in _process_sub_completions after the group is
+        # fully resolved (all I/O complete, buffer has valid data).
+        # Do NOT trigger it here — the buffers haven't been read yet.
 
         return results
 
@@ -2654,9 +2645,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
                 )
                 if group_hash is None:
                     continue
-                remaining = (
-                    self._group_pending_count.get(group_hash, 0) - 1
-                )
+                remaining = self._group_pending_count[group_hash] - 1
                 if remaining > 0:
                     self._group_pending_count[group_hash] = remaining
                     continue
@@ -2674,20 +2663,13 @@ class KVStreamDiskBackend(StorageBackendInterface):
                 )
                 if group_hash is None:
                     continue
-                remaining = self._group_pending_count.get(
-                    group_hash, 0
-                )
+                remaining = self._group_pending_count[group_hash]
                 if remaining > 0:
                     continue
 
             # All sub-hashes for this group are done
-            if group_hash in self._group_pending_count:
-                del self._group_pending_count[group_hash]
-            key, memory_obj = self._group_meta.pop(
-                group_hash, (None, None)
-            )
-            if key is None:
-                continue
+            del self._group_pending_count[group_hash]
+            key, memory_obj = self._group_meta.pop(group_hash)
             self._overlapped_load_refs.pop(group_hash, None)
             # Recover cached_positions metadata
             disk_meta = self.dict.get(key, None)
@@ -2696,6 +2678,13 @@ class KVStreamDiskBackend(StorageBackendInterface):
                     disk_meta.cached_positions
                 )
             ready.append((group_hash, key, memory_obj))
+
+            # Trigger replication for non-replicated chunks that
+            # were just read from disk.  The buffer now has valid
+            # data (all io_uring reads complete).
+            if self._replicated_chunks:
+                self._maybe_enqueue_replication(key, memory_obj)
+
         return ready
 
     @_lmcache_nvtx_annotate
