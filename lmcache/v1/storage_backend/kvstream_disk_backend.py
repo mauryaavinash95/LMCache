@@ -1434,6 +1434,10 @@ class KVStreamDiskBackend(StorageBackendInterface):
         """
         if not self._replicated_chunks:
             return
+        # Guard against drain thread running before __init__ finishes
+        # setting up the replication state.
+        if not hasattr(self, "_repl_inflight"):
+            return
         if self._repl_inflight >= self._repl_max_inflight:
             return
 
@@ -2459,12 +2463,26 @@ class KVStreamDiskBackend(StorageBackendInterface):
                     continue
                 self.cache_policy.update_on_hit(key, self.dict)
                 meta: _TieredChunkMeta = self.dict[key]
+                # Snapshot slices under lock — the drain thread may
+                # append a replication slice concurrently.
+                slices_snapshot = list(meta.slices)
+                is_repl = meta.is_replicated
                 shape = meta.shape
                 dtype = meta.dtype
                 fmt = meta.fmt
 
             assert dtype is not None
             assert shape is not None
+
+            # Build a lightweight snapshot meta for the submit
+            # functions so they don't reference the live meta.slices.
+            snap_meta = _TieredChunkMeta(
+                slices=slices_snapshot,
+                total_size=meta.total_size,
+                shape=shape,
+                dtype=dtype,
+                fmt=fmt,
+            )
 
             memory_obj = self.local_cpu_backend.allocate(
                 shape, dtype, fmt
@@ -2482,13 +2500,13 @@ class KVStreamDiskBackend(StorageBackendInterface):
 
             if (
                 self._replicated_chunks
-                and meta.is_replicated
+                and is_repl
             ):
                 # Replicated chunk: submit only the static reads
                 # (sub-chunk A from NVMe).  Sub-chunk B is deferred
                 # to work-stealing.
                 load_refs = self._submit_static_loads(
-                    key, meta, raw_tensor
+                    key, snap_meta, raw_tensor
                 )
                 self._overlapped_load_refs[group_hash] = load_refs
 
@@ -2505,7 +2523,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
                     self._tier_pending_subs[tier_idx] += 1
 
                 steal_pool.append((
-                    group_hash, key, memory_obj, meta,
+                    group_hash, key, memory_obj, snap_meta,
                     raw_tensor,
                     self._repl_layer_start,
                     self._repl_layer_end,
@@ -2513,7 +2531,7 @@ class KVStreamDiskBackend(StorageBackendInterface):
             else:
                 # Non-replicated: submit all tier reads immediately.
                 load_refs = self._submit_tiered_loads(
-                    key, meta, raw_tensor
+                    key, snap_meta, raw_tensor
                 )
                 self._overlapped_load_refs[group_hash] = load_refs
                 self._group_pending_count[group_hash] = len(
