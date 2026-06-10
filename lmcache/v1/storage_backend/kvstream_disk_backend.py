@@ -1,6 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """KVStream disk backend for LMCache — P-tier weighted layer-striped storage.
 
+.. deprecated::
+    This backend (placement modes ``layer_stripe``, ``whole_chunk``,
+    ``replicated_chunks``) is **deprecated** and scheduled for deletion
+    in the next release.  All new development should target
+    ``KVStreamBlockReplicatedBackend`` (``kvstream_placement =
+    "block_replicated"``) which provides a cleaner block-level
+    granularity, dynamic work-stealing, and single/multi-tier support.
+
+# TODO(delete in next release): KVStreamDiskBackend is obsolete; only
+# block_replicated placement is supported.
+
 Uses the KVStream library (io_uring-based async I/O engine) to perform
 high-performance disk reads and writes for KV cache data, replacing the
 Python open()/write()/read() calls used by LocalDiskBackend.
@@ -40,6 +51,16 @@ import asyncio
 import os
 import threading
 import time
+import warnings
+
+warnings.warn(
+    "kvstream_disk_backend (placement modes layer_stripe / whole_chunk / "
+    "replicated_chunks) is deprecated and will be removed in the next "
+    "release. Use KVStreamBlockReplicatedBackend instead "
+    "(set kvstream_placement='block_replicated').",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 # Third Party
 import torch

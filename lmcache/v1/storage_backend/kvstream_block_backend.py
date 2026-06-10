@@ -254,24 +254,25 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         self._chunk_bytes: int = self._kv_size * self._kv_block_bytes
 
         # -- Tier 1 (PFS) path ------------------------------------------
+        # Empty path => single-tier mode (NVMe only). Used by ablation
+        # variants that isolate the contribution of multi-path replication.
         pfs_path: str = str(extra.get("kvstream_tier_1_path", ""))
-        if not pfs_path:
-            raise ValueError(
-                "block_replicated requires kvstream_tier_1_path "
-                "to be set for the PFS tier."
-            )
-        if not os.path.exists(pfs_path):
+        self._num_tiers: int = 2 if pfs_path else 1
+        if pfs_path and not os.path.exists(pfs_path):
             os.makedirs(pfs_path)
             logger.info(
                 "Created KVStream PFS tier directory: %s", pfs_path
             )
 
-        # -- Build tier engines (exactly 2) ------------------------------
-        self._tier_paths: list[str] = [self.path, pfs_path]
-        self._tier_locking: list[str] = locking_modes[:2]
+        # -- Build tier engines (1 or 2 depending on PFS availability) ---
+        if self._num_tiers == 2:
+            self._tier_paths: list[str] = [self.path, pfs_path]
+        else:
+            self._tier_paths = [self.path]
+        self._tier_locking: list[str] = locking_modes[:self._num_tiers]
         self._tier_engines: list[Any] = []
 
-        for i in range(2):
+        for i in range(self._num_tiers):
             read_chunk_kb = int(
                 extra.get(
                     f"kvstream_tier_{i}_read_chunk_size_kb",
@@ -347,6 +348,46 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             extra.get("kvstream_steal_batch_size", 4)
         )
 
+        # -- Static partition mode (no work stealing) --------------------
+        # When steal_batch < 0, the two tiers operate on disjoint, fixed
+        # index ranges defined by kvstream_split_ratios. This isolates
+        # the contribution of adaptive work-stealing for ablation.
+        self._static_partition: bool = self._steal_batch < 0
+        ratios_str: str = str(extra.get("kvstream_split_ratios", ""))
+        if ratios_str:
+            try:
+                parsed = [float(x) for x in ratios_str.split(":")]
+            except ValueError as e:
+                raise ValueError(
+                    f"kvstream_split_ratios must be colon-separated "
+                    f"floats, got '{ratios_str}'"
+                ) from e
+            if abs(sum(parsed) - 1.0) > 1e-6:
+                raise ValueError(
+                    f"kvstream_split_ratios must sum to 1.0, "
+                    f"got {sum(parsed)}: {ratios_str}"
+                )
+            self._split_ratios: list[float] = parsed
+        elif self._num_tiers == 1:
+            self._split_ratios = [1.0]
+        else:
+            # Default 3:1 from Table II NVMe:PFS read bandwidth ratio.
+            self._split_ratios = [0.75, 0.25]
+
+        if (self._static_partition
+                and self._num_tiers != len(self._split_ratios)):
+            raise ValueError(
+                f"kvstream_split_ratios length "
+                f"({len(self._split_ratios)}) must match num_tiers "
+                f"({self._num_tiers})"
+            )
+
+        # Cursor boundaries (re-computed per call in submit_batch_load).
+        # In dynamic mode they cover the full range; in static mode they
+        # encode the partition pivot.
+        self._tier_0_end: int = 0
+        self._tier_1_start: int = 0
+
         # -- Inflight write tracking (grouped drain) ---------------------
         self._hash_to_write_group: dict[str, _WriteGroup] = {}
         self._drain_lock = threading.Lock()
@@ -362,7 +403,7 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         # Completed block indices (first-wins semantics)
         self._done_blocks: set[int] = set()
         # Per-tier inflight read count
-        self._tier_inflight: list[int] = [0, 0]
+        self._tier_inflight: list[int] = [0] * self._num_tiers
         # Dual cursors
         self._nvme_cursor: int = 0
         self._pfs_cursor: int = -1
@@ -408,15 +449,19 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
 
         logger.info(
             "KVStreamBlockReplicatedBackend initialized: "
-            "placement=block_replicated, "
+            "placement=block_replicated, num_tiers=%d, "
             "chunk_bytes=%d, num_layers=%d, kv_size=%d, "
             "steal_batch=%d, deferred_writes=%s, "
+            "static_partition=%s, split_ratios=%s, "
             "drain_interval=%.3fs",
+            self._num_tiers,
             self._chunk_bytes,
             self._num_layers,
             self._kv_size,
             self._steal_batch,
             self._deferred_writes_enabled,
+            self._static_partition,
+            self._split_ratios,
             drain_interval,
         )
 
@@ -841,10 +886,10 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             fmt = memory_obj.metadata.fmt
             cached_positions = memory_obj.metadata.cached_positions
 
-            # Build file paths for both tiers
+            # Build file paths for all active tiers (1 or 2)
             tier_paths = [
-                self._key_to_path(key, 0),
-                self._key_to_path(key, 1),
+                self._key_to_path(key, ti)
+                for ti in range(self._num_tiers)
             ]
             meta = _BlockMeta(
                 tier_paths=tier_paths,
@@ -858,14 +903,14 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             group = _WriteGroup(
                 key=key,
                 memory_obj=memory_obj,
-                remaining=2,  # one save per tier
+                remaining=self._num_tiers,  # one save per tier
                 meta=meta,
                 on_complete_callback=on_complete_callback,
             )
 
             # Build save ops: one per tier, full blob
             save_ops: list[tuple[Any, str, torch.Tensor, str]] = []
-            for ti in range(2):
+            for ti in range(self._num_tiers):
                 io_hash = self._next_io_hash(key, f"save_t{ti}")
                 group.io_hashes.append(io_hash)
                 save_ops.append((
@@ -929,7 +974,7 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
     def _wait_rw_locked_tiers(self) -> None:
         """Block until writes complete on rw-locked tiers."""
         io_queue_write = self.kvstream_core.IOQueue.WRITE
-        for ti in range(2):
+        for ti in range(self._num_tiers):
             if self._tier_locking[ti] != "rw":
                 continue
             torch.cuda.nvtx.range_push(f"kvs_rw_wait_t{ti}")
@@ -997,17 +1042,37 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         new_items_added = total > base_idx
 
         if new_items_added:
-            # Extend PFS cursor to cover newly added items (never
-            # move it backward — earlier items may already be done
-            # or in-flight from a prior call this step).
-            self._pfs_cursor = max(self._pfs_cursor, total - 1)
+            # Compute cursor boundaries.
+            # Dynamic mode (work-stealing): tier 0 covers [0, total),
+            # tier 1 covers (-, total) going backward — boundaries are
+            # effectively the full range.
+            # Static mode: tier 0 owns [0, n_pivot), tier 1 owns
+            # [n_pivot, total). Cursors stop at the pivot.
+            if self._static_partition and self._num_tiers > 1:
+                n_pivot = int(total * self._split_ratios[0])
+                self._tier_0_end = n_pivot
+                self._tier_1_start = n_pivot
+            else:
+                self._tier_0_end = total
+                self._tier_1_start = 0
 
-            for _ in range(self._steal_batch):
+            if self._num_tiers > 1:
+                # Extend PFS cursor to cover newly added items (never
+                # move it backward — earlier items may already be done
+                # or in-flight from a prior call this step).
+                self._pfs_cursor = max(self._pfs_cursor, total - 1)
+
+            # Submit initial batch from each active tier. In static
+            # mode, _steal_batch is negative; use its magnitude as the
+            # initial batch size (no actual stealing will occur).
+            steal = max(1, abs(self._steal_batch))
+            for _ in range(steal):
                 if not self._submit_next_block(0):
                     break
-            for _ in range(self._steal_batch):
-                if not self._submit_next_block(1):
-                    break
+            if self._num_tiers > 1:
+                for _ in range(steal):
+                    if not self._submit_next_block(1):
+                        break
 
         self._pending_count = total - len(self._done_blocks)
 
@@ -1021,17 +1086,26 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
                       1 = PFS (back, descending).
 
         Returns:
-            Work item index, or ``None`` if exhausted.
+            Work item index, or ``None`` if exhausted, out of the
+            tier's static-partition range, or the tier is inactive.
         """
+        # Tier 1 has no work in single-tier mode.
+        if tier_idx == 1 and self._num_tiers == 1:
+            return None
         while True:
             if tier_idx == 0:
                 idx = self._nvme_cursor
-                if idx >= len(self._work_items):
+                # Stop at end-of-list OR at static-partition pivot.
+                # In dynamic mode _tier_0_end == len(self._work_items).
+                if (idx >= self._tier_0_end
+                        or idx >= len(self._work_items)):
                     return None
                 self._nvme_cursor += 1
             else:
                 idx = self._pfs_cursor
-                if idx < 0:
+                # Stop at start-of-list OR at static-partition pivot.
+                # In dynamic mode _tier_1_start == 0.
+                if idx < self._tier_1_start or idx < 0:
                     return None
                 self._pfs_cursor -= 1
             if idx not in self._done_blocks:
@@ -1087,8 +1161,8 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         io_queue_read = self.kvstream_core.IOQueue.READ
 
         while not ready:
-            # Phase 1: non-blocking drain from both engines
-            for ti in range(2):
+            # Phase 1: non-blocking drain from each active engine
+            for ti in range(self._num_tiers):
                 newly_done = self._tier_engines[ti].drain_completed_queue(
                     io_queue_read
                 )
@@ -1100,7 +1174,7 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
 
             # Phase 2: block on a tier with inflight > 0
             blocked = False
-            for ti in range(2):
+            for ti in range(self._num_tiers):
                 if self._tier_inflight[ti] > 0:
                     torch.cuda.nvtx.range_push(f"kvs_wait_any_t{ti}")
                     completed = self._tier_engines[
@@ -1178,10 +1252,13 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         self._work_items.clear()
         self._io_hash_to_block.clear()
         self._done_blocks.clear()
-        self._tier_inflight = [0, 0]
+        self._tier_inflight = [0] * self._num_tiers
         self._nvme_cursor = 0
         self._pfs_cursor = -1
         self._pending_count = 0
+        # Cursor boundaries are re-computed in submit_batch_load.
+        self._tier_0_end = 0
+        self._tier_1_start = 0
 
     # ------------------------------------------------------------------ #
     #  Stats                                                               #
@@ -1264,5 +1341,6 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             self.batched_msg_sender.close()
 
         logger.info(
-            "KVStreamBlockReplicatedBackend closed (2 tiers)."
+            "KVStreamBlockReplicatedBackend closed (%d tier(s)).",
+            self._num_tiers,
         )
