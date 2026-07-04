@@ -511,15 +511,20 @@ class LMCacheEngine:
                 kv_dtypes = self.metadata.get_dtypes()
 
                 # TODO (Jiayi): should be batched in the future
-                memory_obj = self.storage_manager.allocate(
-                    kv_shapes,
-                    kv_dtypes,
-                    busy_loop=self.config.get_extra_config_value(
-                        "force_store_wait", False
-                    ),
-                    fmt=self.fmt,
-                )
+                # Isolate CPU allocation + synchronous eviction time from
+                # token processing so write-back-pressure stalls (chunks
+                # pinned by in-flight deferred writes) are attributable.
+                with store_stats.profile_allocate():
+                    memory_obj = self.storage_manager.allocate(
+                        kv_shapes,
+                        kv_dtypes,
+                        busy_loop=self.config.get_extra_config_value(
+                            "force_store_wait", False
+                        ),
+                        fmt=self.fmt,
+                    )
                 if memory_obj is None:
+                    store_stats.n_alloc_none += 1
                     logger.warning(
                         "Local cpu memory under pressure so"
                         " choosing to store only "
@@ -586,9 +591,17 @@ class LMCacheEngine:
         )
         tot_time = store_stats.time_to_store()
 
+        # NOTE: allocate_time is a SUBSET of process_tokens_time (the
+        # allocate() call happens inside the process_tokens loop). We log
+        # it separately AND report the net token-processing time
+        # (process_tokens_time - allocate_time) so the phases are
+        # non-overlapping and sum cleanly.
+        net_process_tokens_time = (
+            store_stats.process_tokens_time - store_stats.allocate_time
+        )
         logger.info(
             "Stored %d out of total %d tokens. size: %.4f GB, cost %.4f ms, "
-            "throughput: %.4f GB/s; offload_time: %.4f ms, process_tokens_time: %.4f ms, from_gpu_time: %.4f ms, put_time: %.4f ms",
+            "throughput: %.4f GB/s; offload_time: %.4f ms, process_tokens_time: %.4f ms, from_gpu_time: %.4f ms, put_time: %.4f ms, allocate_time: %.4f ms, net_process_tokens_time: %.4f ms, n_alloc_none: %d",
             tot_token_num,
             num_to_store_tokens,
             tot_kv_size / 1024**3,
@@ -598,6 +611,9 @@ class LMCacheEngine:
             store_stats.process_tokens_time * 1000,
             store_stats.from_gpu_time * 1000,
             store_stats.put_time * 1000,
+            store_stats.allocate_time * 1000,
+            net_process_tokens_time * 1000,
+            store_stats.n_alloc_none,
         )
 
     @_lmcache_nvtx_annotate

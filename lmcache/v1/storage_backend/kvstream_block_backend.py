@@ -1312,6 +1312,61 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             engine.reset_stats(IOQueue.WRITE)
         return results
 
+    def get_write_backlog_stats(self) -> dict[str, Any]:
+        """Snapshot deferred-write backlog and pinning pressure.
+
+        Used by Phase-1 instrumentation to test the write-back-pressure
+        hypothesis: slow (2x replicated) deferred flushes keep CPU
+        chunks pinned (``ref_count_up`` held until *both* tier writes
+        complete), which can stall the next step's store ``allocate()``.
+
+        Returns:
+            Dict with:
+              - ``deferred_queue_len``: chunks queued but not yet
+                submitted to io_uring.
+              - ``inflight_write_groups``: chunks whose writes have been
+                submitted but not yet completed on all tiers (each keeps
+                its CPU ``memory_obj`` pinned).
+              - ``pinned_mb``: aggregate bytes of CPU chunks pinned by
+                in-flight writes.
+              - ``put_tasks_len``: number of registered (not-yet-final)
+                put tasks.
+              - ``disk_fill``: current_cache_size / max_cache_size for
+                the disk tier (1.0 => disk-tier eviction pressure).
+              - ``disk_used_gb`` / ``disk_max_gb``: raw disk-tier sizes.
+        """
+        # Each in-flight chunk contributes ``_num_tiers`` io_hashes to
+        # the map; divide to count logical chunks.
+        n_io_hashes = len(self._hash_to_write_group)
+        inflight_groups = (
+            n_io_hashes // self._num_tiers if self._num_tiers else n_io_hashes
+        )
+        # Sum pinned bytes over the *unique* in-flight write groups.
+        seen: set[int] = set()
+        pinned_bytes = 0
+        for group in self._hash_to_write_group.values():
+            gid = id(group)
+            if gid in seen:
+                continue
+            seen.add(gid)
+            pinned_bytes += group.meta.chunk_bytes
+        with self.put_tasks_lock:
+            put_tasks_len = len(self.put_tasks)
+        disk_fill = (
+            self.current_cache_size / self.max_cache_size
+            if self.max_cache_size > 0
+            else 0.0
+        )
+        return {
+            "deferred_queue_len": len(self._deferred_queue),
+            "inflight_write_groups": inflight_groups,
+            "pinned_mb": round(pinned_bytes / 1e6, 1),
+            "put_tasks_len": put_tasks_len,
+            "disk_fill": round(disk_fill, 4),
+            "disk_used_gb": round(self.current_cache_size / 1024**3, 3),
+            "disk_max_gb": round(self.max_cache_size / 1024**3, 3),
+        }
+
     # ------------------------------------------------------------------ #
     #  Close / lifecycle                                                   #
     # ------------------------------------------------------------------ #

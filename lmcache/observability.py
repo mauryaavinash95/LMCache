@@ -193,6 +193,16 @@ class StoreRequestStats:
     process_tokens_time: float = 0
     from_gpu_time: float = 0
     put_time: float = 0
+    # Fine-grained store-phase decomposition (Phase-1 instrumentation).
+    # ``allocate_time`` isolates CPU-memory allocation + synchronous
+    # eviction from ``process_tokens_time`` so that write-back-pressure
+    # stalls (CPU chunks pinned by in-flight deferred writes) are
+    # attributable rather than hidden inside token processing.
+    allocate_time: float = 0
+    # Counter: allocate() returned None -> KV chunk silently dropped
+    # (store gives up under CPU pressure). Suspected contributor to
+    # re-read/recompute amplification, so tracked explicitly.
+    n_alloc_none: int = 0
 
     def time_to_store(self):
         if self.end_time == 0:
@@ -211,6 +221,14 @@ class StoreRequestStats:
             yield
         finally:
             self.process_tokens_time += time.perf_counter() - start
+
+    @contextmanager
+    def profile_allocate(self):
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.allocate_time += time.perf_counter() - start
 
     @contextmanager
     def profile_from_gpu(self):

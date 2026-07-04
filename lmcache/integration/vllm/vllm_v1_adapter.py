@@ -573,6 +573,18 @@ class LMCacheConnectorV1Impl:
         self._step_logging_enabled: bool = bool(
             config.get_extra_config_value("kvstream_step_logging", False)
         )
+        # Phase-1 store profiling (gated behind kvstream_store_profiling,
+        # independent of step logging / hash tracing so the store phase
+        # can be decomposed WITHOUT the heavy hash-trace tier-presence
+        # probe polluting the measurement).
+        self._store_profiling_enabled: bool = bool(
+            config.get_extra_config_value("kvstream_store_profiling", False)
+        )
+        # Hash tracing (HASH_TRACE lines + the O(chunks x backends)
+        # tier-presence probe) is tied to kvstream_step_logging. Exposed
+        # as its own flag so the store-profiling study can turn the probe
+        # OFF to isolate its cost from genuine store back-pressure.
+        self._hash_trace_enabled: bool = self._step_logging_enabled
 
         # Deferred-write support: reference to KVStream backend (lazy init).
         # Set on first start_load_kv call if the backend has deferred writes
@@ -597,6 +609,16 @@ class LMCacheConnectorV1Impl:
         self._step_t3: float = 0.0  # after all retrieval (end of start_load_kv)
         self._step_timing_counter: int = 0
         self._step_timing_total_tokens: int = 0
+
+        # ---- Phase-1 store-phase decomposition accumulators ----
+        # Reset at entry of wait_for_save, populated during the store
+        # loop, consumed by _emit_step_timing. All in seconds.
+        self._store_probe_time: float = 0.0  # hash-trace tier-presence probe
+        self._store_unpin_time: float = 0.0  # lookup_unpin calls
+        self._store_call_time: float = 0.0  # lmcache_engine.store() calls
+        self._store_emit_time: float = 0.0  # tracer.emit() calls
+        # Backlog snapshot taken at entry of wait_for_save.
+        self._store_backlog_stats: dict = {}
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -894,39 +916,41 @@ class LMCacheConnectorV1Impl:
             token_mask[:masked_token_count] = False
 
             # Hash tracing: create tracer and compute all hashes
-            _tracer = RequestHashTracer(
-                req_id=request.req_id,
-                chunk_size=self._lmcache_chunk_size,
-            )
-            _all_keys: list = [
-                key
-                for _, _, key in
-                self.lmcache_engine.token_database.process_tokens(
-                    tokens=tokens,
-                    request_configs=request.request_configs,
+            # (skipped entirely when hash tracing is disabled).
+            if self._hash_trace_enabled:
+                _tracer = RequestHashTracer(
+                    req_id=request.req_id,
+                    chunk_size=self._lmcache_chunk_size,
                 )
-            ]
-            _all_hashes = [k.chunk_hash for k in _all_keys]
-            _tracer.set_all_hashes(_all_hashes, len(tokens))
-            _tracer.set_vllm_gpu_prefix(
-                request.load_spec.vllm_cached_tokens,
-            )
+                _all_keys: list = [
+                    key
+                    for _, _, key in
+                    self.lmcache_engine.token_database.process_tokens(
+                        tokens=tokens,
+                        request_configs=request.request_configs,
+                    )
+                ]
+                _all_hashes = [k.chunk_hash for k in _all_keys]
+                _tracer.set_all_hashes(_all_hashes, len(tokens))
+                _tracer.set_vllm_gpu_prefix(
+                    request.load_spec.vllm_cached_tokens,
+                )
 
-            # Probe each backend for every hash (independent of
-            # prefix-chain contiguity) to detect orphaned presence.
-            _sm = self.lmcache_engine.storage_manager
-            if _sm is not None:
-                _tier_presence = {}
-                for _key in _all_keys:
-                    _tiers = []
-                    for _bn, _be in _sm.get_active_storage_backends():
-                        if _be.contains(_key, pin=False):
-                            _tiers.append(_bn)
-                    if _tiers:
-                        _tier_presence[_key.chunk_hash] = _tiers
-                _tracer.set_tier_presence(_tier_presence)
+                # Probe each backend for every hash (independent of
+                # prefix-chain contiguity) to detect orphaned presence.
+                _sm = self.lmcache_engine.storage_manager
+                if _sm is not None:
+                    _tier_presence = {}
+                    for _key in _all_keys:
+                        _tiers = []
+                        for _bn, _be in _sm.get_active_storage_backends():
+                            if _be.contains(_key, pin=False):
+                                _tiers.append(_bn)
+                        if _tiers:
+                            _tier_presence[_key.chunk_hash] = _tiers
+                    _tracer.set_tier_presence(_tier_presence)
 
-            self.lmcache_engine.hash_tracers[request.req_id] = _tracer
+                self.lmcache_engine.hash_tracers[request.req_id] = _tracer
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
             if self.use_layerwise:
@@ -1087,11 +1111,8 @@ class LMCacheConnectorV1Impl:
             )
             token_mask[:masked_token_count] = False
 
-            # Hash tracing
-            _tracer = RequestHashTracer(
-                req_id=request.req_id,
-                chunk_size=self._lmcache_chunk_size,
-            )
+            # _all_keys is needed below for CPU pinning, so always compute
+            # it; the tracer + per-backend tier-presence probe are gated.
             _all_keys: list = [
                 key
                 for _, _, key in
@@ -1100,24 +1121,30 @@ class LMCacheConnectorV1Impl:
                     request_configs=request.request_configs,
                 )
             ]
-            _all_hashes = [k.chunk_hash for k in _all_keys]
-            _tracer.set_all_hashes(_all_hashes, len(tokens))
-            _tracer.set_vllm_gpu_prefix(
-                request.load_spec.vllm_cached_tokens,
-            )
-            if _sm is not None:
-                _tier_presence = {}
-                for _key in _all_keys:
-                    _tiers = []
-                    for _bn, _be in _sm.get_active_storage_backends():
-                        if _be.contains(_key, pin=False):
-                            _tiers.append(_bn)
-                    if _tiers:
-                        _tier_presence[_key.chunk_hash] = _tiers
-                _tracer.set_tier_presence(_tier_presence)
-            self.lmcache_engine.hash_tracers[
-                request.req_id
-            ] = _tracer
+            if self._hash_trace_enabled:
+                # Hash tracing
+                _tracer = RequestHashTracer(
+                    req_id=request.req_id,
+                    chunk_size=self._lmcache_chunk_size,
+                )
+                _all_hashes = [k.chunk_hash for k in _all_keys]
+                _tracer.set_all_hashes(_all_hashes, len(tokens))
+                _tracer.set_vllm_gpu_prefix(
+                    request.load_spec.vllm_cached_tokens,
+                )
+                if _sm is not None:
+                    _tier_presence = {}
+                    for _key in _all_keys:
+                        _tiers = []
+                        for _bn, _be in _sm.get_active_storage_backends():
+                            if _be.contains(_key, pin=False):
+                                _tiers.append(_bn)
+                        if _tiers:
+                            _tier_presence[_key.chunk_hash] = _tiers
+                    _tracer.set_tier_presence(_tier_presence)
+                self.lmcache_engine.hash_tracers[
+                    request.req_id
+                ] = _tracer
 
             lmcache_cached_tokens = (
                 request.load_spec.lmcache_cached_tokens
@@ -1524,6 +1551,23 @@ class LMCacheConnectorV1Impl:
         # T4: entry of wait_for_save (= end of GPU forward pass)
         _t4 = time.perf_counter()
 
+        # Reset Phase-1 store-decomposition accumulators for this step and
+        # snapshot the write backlog BEFORE the store loop runs (captures
+        # the pressure the upcoming allocate() calls will face).
+        self._store_probe_time = 0.0
+        self._store_unpin_time = 0.0
+        self._store_call_time = 0.0
+        self._store_emit_time = 0.0
+        self._store_backlog_stats = {}
+        if self._store_profiling_enabled and self._kvstream_backend is not None:
+            try:
+                self._store_backlog_stats = (
+                    self._kvstream_backend.get_write_backlog_stats()
+                )
+            except AttributeError:
+                # Backend variant without backlog stats (e.g. disk backend).
+                self._store_backlog_stats = {}
+
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
 
@@ -1551,7 +1595,10 @@ class LMCacheConnectorV1Impl:
 
         for request in connector_metadata.requests:
             # unpin the kv caches according to req_id
+            _tu = time.perf_counter() if self._store_profiling_enabled else 0.0
             self.lmcache_engine.lookup_unpin(request.req_id)
+            if self._store_profiling_enabled:
+                self._store_unpin_time += time.perf_counter() - _tu
 
             save_spec = request.save_spec
             if (
@@ -1623,7 +1670,10 @@ class LMCacheConnectorV1Impl:
                     slot_mapping = slot_mapping[:aligned_token_len]
 
             # Hash tracing: ensure tracer exists for store-only requests
-            if request.req_id not in self.lmcache_engine.hash_tracers:
+            if (
+                self._hash_trace_enabled
+                and request.req_id not in self.lmcache_engine.hash_tracers
+            ):
                 _tracer = RequestHashTracer(
                     req_id=request.req_id,
                     chunk_size=self._lmcache_chunk_size,
@@ -1639,9 +1689,17 @@ class LMCacheConnectorV1Impl:
                 _all_hashes = [k.chunk_hash for k in _all_keys_store]
                 _tracer.set_all_hashes(_all_hashes, len(request.token_ids))
 
-                # Probe tier presence for store-only requests too
+                # Probe tier presence for store-only requests too.
+                # This is O(chunks x backends) contains() calls (each may
+                # take disk_lock) and is a prime suspect for inflating the
+                # store phase; time it separately.
                 _sm = self.lmcache_engine.storage_manager
                 if _sm is not None:
+                    _tp = (
+                        time.perf_counter()
+                        if self._store_profiling_enabled
+                        else 0.0
+                    )
                     _tier_presence = {}
                     for _key in _all_keys_store:
                         _tiers = []
@@ -1651,9 +1709,12 @@ class LMCacheConnectorV1Impl:
                         if _tiers:
                             _tier_presence[_key.chunk_hash] = _tiers
                     _tracer.set_tier_presence(_tier_presence)
+                    if self._store_profiling_enabled:
+                        self._store_probe_time += time.perf_counter() - _tp
 
                 self.lmcache_engine.hash_tracers[request.req_id] = _tracer
 
+            _ts = time.perf_counter() if self._store_profiling_enabled else 0.0
             self.lmcache_engine.store(
                 token_ids,
                 mask=store_mask,
@@ -1664,13 +1725,18 @@ class LMCacheConnectorV1Impl:
                 request_configs=request.request_configs,
                 req_id=request.req_id,
             )
+            if self._store_profiling_enabled:
+                self._store_call_time += time.perf_counter() - _ts
 
             # Hash tracing: emit the consolidated JSON log
             _tracer = self.lmcache_engine.hash_tracers.pop(
                 request.req_id, None
             )
             if _tracer is not None:
+                _te = time.perf_counter() if self._store_profiling_enabled else 0.0
                 _tracer.emit()
+                if self._store_profiling_enabled:
+                    self._store_emit_time += time.perf_counter() - _te
 
             # Update skip_leading_tokens only on last rank to ensure
             # each PP stage stores its own KV cache
@@ -1739,11 +1805,41 @@ class LMCacheConnectorV1Impl:
                     f"/{ts['write_ops']}ops"
                 )
 
+        # Phase-1 store-phase decomposition + write-backlog suffix.
+        # ``store_ms`` is decomposed into: store()-call time (which itself
+        # contains allocate/D2H/put), the hash-trace tier-presence probe,
+        # unpin, emit, and an ``other`` residual (bookkeeping not covered
+        # above). The backlog snapshot (taken at entry) shows the pinning
+        # pressure the store's allocate() faced.
+        store_parts = ""
+        if self._store_profiling_enabled:
+            probe_ms = self._store_probe_time * 1e3
+            unpin_ms = self._store_unpin_time * 1e3
+            call_ms = self._store_call_time * 1e3
+            emit_ms = self._store_emit_time * 1e3
+            other_ms = store_ms - (probe_ms + unpin_ms + call_ms + emit_ms)
+            store_parts = (
+                f" store_call={call_ms:.1f}ms"
+                f" store_probe={probe_ms:.1f}ms"
+                f" store_unpin={unpin_ms:.1f}ms"
+                f" store_emit={emit_ms:.1f}ms"
+                f" store_other={other_ms:.1f}ms"
+            )
+            b = self._store_backlog_stats
+            if b:
+                store_parts += (
+                    f" wr_deferred={b.get('deferred_queue_len', 0)}"
+                    f" wr_inflight={b.get('inflight_write_groups', 0)}"
+                    f" pin_mb={b.get('pinned_mb', 0)}"
+                    f" put_tasks={b.get('put_tasks_len', 0)}"
+                    f" disk_fill={b.get('disk_fill', 0)}"
+                )
+
         logger.info(
             "STEP_TIMING step=%d total=%.1fms "
             "flush=%.1fms retrieve=%.1fms "
             "forward=%.1fms store=%.1fms "
-            "tokens=%d%s",
+            "tokens=%d%s%s",
             self._step_timing_counter,
             total_ms,
             flush_ms,
@@ -1752,6 +1848,7 @@ class LMCacheConnectorV1Impl:
             store_ms,
             self._step_timing_total_tokens,
             tier_parts,
+            store_parts,
         )
 
     @_lmcache_nvtx_annotate
