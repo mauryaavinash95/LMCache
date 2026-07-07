@@ -577,12 +577,27 @@ class LMCacheEngine:
         with store_stats.profile_from_gpu():
             self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
 
+        # Per-chunk fractional prefix position in [0, 1] (first chunk -> 0,
+        # last -> 1), used by tier-aware backends (e.g. KVStream delta-band
+        # placement) to decide NVMe/PFS/both placement.  Purely advisory;
+        # backends that ignore it are unaffected.
+        placement_hints: Optional[List[float]] = None
+        if starts:
+            chunk_toks = max(1, int(self.config.chunk_size))
+            last_end = max(ends)
+            total_chunks = (last_end + chunk_toks - 1) // chunk_toks
+            denom = max(1, total_chunks - 1)
+            placement_hints = [(s // chunk_toks) / denom for s in starts]
+
         with store_stats.profile_put():
             transfer_spec = kwargs.get("transfer_spec", None)
             # TODO: we implicitly rely on batched_put to call ref_count_down
             # this management should be done in a cleaner way
             self.storage_manager.batched_put(
-                keys, memory_objs, transfer_spec=transfer_spec
+                keys,
+                memory_objs,
+                transfer_spec=transfer_spec,
+                placement_hints=placement_hints,
             )
 
         self.stats_monitor.on_store_finished(

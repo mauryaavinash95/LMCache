@@ -382,12 +382,18 @@ class StorageManager:
         memory_objs: List[MemoryObj],
         transfer_spec=None,
         location: Optional[str] = None,
+        placement_hints: Optional[Sequence[float]] = None,
     ) -> None:
         """
         Non-blocking function to batched put the memory objects into the
         storage backends.
         Do not store if the same object is being stored (handled here by
         storage manager) or has been stored (handled by storage backend).
+
+        ``placement_hints`` is an optional per-chunk advisory list
+        (index-aligned with ``keys``) forwarded only to backends that
+        declare ``supports_placement_hints`` and only when the object list
+        is the original (unreindexed) one, so alignment is guaranteed.
         """
         # The dictionary from backend cname to objects and keys
         obj_dict: dict[
@@ -421,7 +427,23 @@ class StorageManager:
             # NOTE: the handling of exists_in_put_tasks
             # is done in the backend
             ks, objs = obj_dict[cname]
-            backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
+            # Forward placement hints only to opting-in backends, and only
+            # when this backend reuses the original (aligned) object list.
+            if (
+                placement_hints is not None
+                and ks is keys
+                and getattr(backend, "supports_placement_hints", False)
+            ):
+                backend.batched_submit_put_task(
+                    ks,
+                    objs,
+                    transfer_spec=transfer_spec,
+                    placement_hints=placement_hints,
+                )
+            else:
+                backend.batched_submit_put_task(
+                    ks, objs, transfer_spec=transfer_spec
+                )
 
         for cname, (ks, objs) in obj_dict.items():
             for memory_obj in objs:

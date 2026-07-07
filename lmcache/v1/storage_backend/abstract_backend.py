@@ -74,6 +74,7 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
         objs: List[MemoryObj],
         transfer_spec: Any = None,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
+        placement_hints: Optional[Sequence[float]] = None,
     ) -> Union[List[Future], None]:
         """
         An async function to put the MemoryObj into the storage backend.
@@ -81,6 +82,10 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
         :param List[CacheEngineKey] keys: The keys of the MemoryObjs.
         :param List[MemoryObj] objs: The MemoryObjs to be stored.
         :param Any transfer_spec: Optional transfer specification.
+        :param placement_hints: Optional per-chunk advisory list
+            (index-aligned with ``keys``) of fractional prefix positions in
+            ``[0, 1]``.  Only tier-aware backends that declare
+            ``supports_placement_hints`` consume it; all others ignore it.
         :param on_complete_callback: Optional callback invoked once per key
             after the backend finishes persisting the KV chunk for that key.
             For batched puts, the callback is invoked separately for each key

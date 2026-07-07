@@ -1835,11 +1835,36 @@ class LMCacheConnectorV1Impl:
                     f" disk_fill={b.get('disk_fill', 0)}"
                 )
 
+        # Overlap-aware read/write timeline + delta-band write metrics.
+        # ``get_io_timeline_and_reset`` drains the C++ per-op intervals for
+        # this step (writes completing during the read window => spill /
+        # contention), plus effective write amplification and host-buffer
+        # allocate wait.  Only the block backend exposes it.
+        io_parts = ""
+        kvsb = self._kvstream_backend
+        if kvsb is not None and hasattr(kvsb, "get_io_timeline_and_reset"):
+            try:
+                tl = kvsb.get_io_timeline_and_reset()
+            except Exception:
+                tl = {}
+            if tl:
+                io_parts += (
+                    f" waf={tl.get('write_amplification', 0)}"
+                    f" chunks_wr={tl.get('chunks_written', 0)}"
+                    f" rd_alloc_wait={tl.get('read_alloc_wait_ms', 0)}ms"
+                )
+                for pt in tl.get("per_tier", []):
+                    io_parts += (
+                        f" t{pt['tier']}_rdbusy={pt['read_busy_ms']}ms"
+                        f"/wrbusy={pt['write_busy_ms']}ms"
+                        f"/rwovl={pt['rw_overlap_ms']}ms"
+                    )
+
         logger.info(
             "STEP_TIMING step=%d total=%.1fms "
             "flush=%.1fms retrieve=%.1fms "
             "forward=%.1fms store=%.1fms "
-            "tokens=%d%s%s",
+            "tokens=%d%s%s%s",
             self._step_timing_counter,
             total_ms,
             flush_ms,
@@ -1849,6 +1874,7 @@ class LMCacheConnectorV1Impl:
             self._step_timing_total_tokens,
             tier_parts,
             store_parts,
+            io_parts,
         )
 
     @_lmcache_nvtx_annotate

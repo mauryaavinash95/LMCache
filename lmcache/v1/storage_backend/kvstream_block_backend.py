@@ -43,6 +43,40 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+# ======================================================================== #
+#  Module-level helpers                                                      #
+# ======================================================================== #
+
+
+def _union_busy_us(intervals: list[tuple[float, float]]) -> float:
+    """Return the total wall-time (us) covered by the union of intervals.
+
+    Overlapping/adjacent intervals are merged so shared time is counted
+    once.  Used to turn per-op (submission_us, completion_us) samples into
+    a device "busy time" and, via inclusion-exclusion, read/write overlap.
+
+    Args:
+        intervals: List of (start_us, end_us) pairs.
+
+    Returns:
+        Union busy time in microseconds.
+    """
+    if not intervals:
+        return 0.0
+    ordered = sorted(intervals)
+    total = 0.0
+    cur_s, cur_e = ordered[0]
+    for s, e in ordered[1:]:
+        if s > cur_e:
+            total += cur_e - cur_s
+            cur_s, cur_e = s, e
+        elif e > cur_e:
+            cur_e = e
+    total += cur_e - cur_s
+    return total
+
+
 # ======================================================================== #
 #  Data model (private to this module)                                      #
 # ======================================================================== #
@@ -50,14 +84,22 @@ logger = init_logger(__name__)
 
 @dataclass
 class _BlockMeta:
-    """Per-key metadata for a fully-replicated chunk.
+    """Per-key metadata for a (possibly partially) replicated chunk.
 
     Stored in ``self.dict`` (the cache policy's mutable mapping).
     Implements ``pin``/``unpin``/``can_evict`` for cache policy
     compatibility.
+
+    ``tiers`` holds the tier indices that physically store this chunk
+    (e.g. ``[0]`` for NVMe-only, ``[1]`` for PFS-only, ``[0, 1]`` for a
+    replicated/band chunk).  ``tier_paths`` is index-aligned with
+    ``tiers`` (one path per held tier).  Under full replication
+    (``delta_band >= 1.0``) every chunk holds all tiers, reproducing the
+    original behaviour.
     """
 
-    tier_paths: list[str]  # [nvme_path, pfs_path]
+    tier_paths: list[str]  # paths for held tiers, index-aligned with `tiers`
+    tiers: list[int]  # tier indices that physically hold this chunk
     chunk_bytes: int  # total raw tensor bytes
     shape: torch.Size
     dtype: torch.dtype
@@ -382,6 +424,59 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
                 f"({self._num_tiers})"
             )
 
+        # -- Partial (delta-band) replication --------------------------------
+        # delta_band is the fraction of each prefix that is replicated on
+        # BOTH tiers (the stealable "band" straddling the NVMe:PFS pivot).
+        #   delta_band >= 1.0 -> full replication (default; original behaviour)
+        #   delta_band == 0.0 -> single placement (front->NVMe, back->PFS)
+        #   0 < delta_band < 1 -> band replication around the pivot
+        # The pivot is split_ratios[0] (NVMe's share of the prefix).
+        # Placement uses a per-chunk fractional prefix position supplied by
+        # the caller (placement_hints); if absent, we fall back to full
+        # replication so correctness never depends on the hint.
+        self._delta_band: float = float(
+            extra.get("kvstream_delta_band", 1.0)
+        )
+        if self._delta_band < 0.0:
+            self._delta_band = 0.0
+        if self._delta_band > 1.0:
+            self._delta_band = 1.0
+        self._placement_pivot: float = (
+            self._split_ratios[0] if self._num_tiers > 1 else 1.0
+        )
+        # Warn once if hints are missing while band placement is requested.
+        self._placement_hint_warned: bool = False
+
+        # -- Per-op timeline recording (overlap analysis) --------------------
+        self._timeline_enabled: bool = bool(
+            extra.get("kvstream_timeline_enabled", False)
+        )
+        if self._timeline_enabled:
+            # Degrade gracefully if kvstream_core predates the timeline API
+            # (avoids a hard crash when the native module isn't rebuilt).
+            if all(
+                hasattr(e, "set_timeline_enabled") for e in self._tier_engines
+            ):
+                for engine in self._tier_engines:
+                    engine.set_timeline_enabled(True)
+            else:
+                logger.warning(
+                    "kvstream_core lacks set_timeline_enabled; rebuild "
+                    "kvstream to enable timeline recording. Disabling."
+                )
+                self._timeline_enabled = False
+
+        # Opt in to receiving per-chunk placement hints from the storage
+        # manager (used by delta-band placement).
+        self.supports_placement_hints: bool = True
+
+        # -- Per-step measurement accumulators (reset each step) -------------
+        # Host-buffer allocate (incl. CPU-cache eviction) wait on the read
+        # path, and write-amplification counters for delta-band placement.
+        self._read_alloc_wait_us: float = 0.0
+        self._chunks_written: int = 0     # logical chunks written
+        self._tier_writes: int = 0        # physical (per-tier) writes
+
         # Cursor boundaries (re-computed per call in submit_batch_load).
         # In dynamic mode they cover the full range; in static mode they
         # encode the partition pivot.
@@ -453,7 +548,8 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             "chunk_bytes=%d, num_layers=%d, kv_size=%d, "
             "steal_batch=%d, deferred_writes=%s, "
             "static_partition=%s, split_ratios=%s, "
-            "drain_interval=%.3fs",
+            "delta_band=%.3f, placement_pivot=%.3f, "
+            "timeline_enabled=%s, drain_interval=%.3fs",
             self._num_tiers,
             self._chunk_bytes,
             self._num_layers,
@@ -462,6 +558,9 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             self._deferred_writes_enabled,
             self._static_partition,
             self._split_ratios,
+            self._delta_band,
+            self._placement_pivot,
+            self._timeline_enabled,
             drain_interval,
         )
 
@@ -641,13 +740,14 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         raw_tensor = memory_obj.raw_tensor
         assert raw_tensor is not None
 
-        # Read from NVMe (tier 0) — full block, single call
-        io_hash = self._next_io_hash(key, "get_blocking_t0")
+        # Read from the first tier that physically holds this chunk.
+        ti0 = meta.tiers[0]
+        io_hash = self._next_io_hash(key, f"get_blocking_t{ti0}")
         io_queue_read = self.kvstream_core.IOQueue.READ
-        self._tier_engines[0].load(
+        self._tier_engines[ti0].load(
             io_hash, raw_tensor, meta.tier_paths[0], 0
         )
-        self._tier_engines[0].wait_one(io_hash, io_queue_read)
+        self._tier_engines[ti0].wait_one(io_hash, io_queue_read)
 
         if meta.cached_positions is not None:
             memory_obj.metadata.cached_positions = (
@@ -807,6 +907,49 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
     #  Write path                                                          #
     # ------------------------------------------------------------------ #
 
+    def _placement_tiers(self, hint: Optional[float]) -> list[int]:
+        """Decide which tier indices physically store a chunk.
+
+        Implements delta-band partial replication: front-of-prefix
+        chunks go to NVMe (tier 0), tail-of-prefix chunks to PFS
+        (tier 1), and a band of width ``delta_band`` straddling the
+        pivot is replicated on both (the stealable set).
+
+        Args:
+            hint: Fractional position of the chunk within its prefix in
+                ``[0, 1]`` (0 = first chunk, 1 = last), or ``None`` if
+                unknown.
+
+        Returns:
+            Sorted list of tier indices that should store this chunk.
+        """
+        # Single-tier deployments always use tier 0.
+        if self._num_tiers == 1:
+            return [0]
+        # Full replication (default) or missing hint -> replicate on all.
+        if self._delta_band >= 1.0 or hint is None:
+            if (
+                hint is None
+                and self._delta_band < 1.0
+                and not self._placement_hint_warned
+            ):
+                logger.warning(
+                    "KVStream delta_band=%.3f requested but placement hint "
+                    "is missing; falling back to full replication.",
+                    self._delta_band,
+                )
+                self._placement_hint_warned = True
+            return list(range(self._num_tiers))
+        # Band placement around the pivot.
+        lo = self._placement_pivot - self._delta_band / 2.0
+        hi = self._placement_pivot + self._delta_band / 2.0
+        p = 0.0 if hint < 0.0 else (1.0 if hint > 1.0 else hint)
+        if p < lo:
+            return [0]  # NVMe-only (front of prefix, hot)
+        if p >= hi:
+            return [1]  # PFS-only (tail of prefix, cold)
+        return [0, 1]  # replicated band (stealable)
+
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def batched_submit_put_task(
@@ -817,23 +960,33 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         on_complete_callback: Optional[
             Callable[[CacheEngineKey], None]
         ] = None,
+        placement_hints: Optional[Sequence[float]] = None,
     ) -> None:
         """Submit a batch of KV chunks for async disk write.
 
-        Each chunk is written in full to both NVMe and PFS (2 I/O
-        operations total).  Writes are optionally deferred until the
-        next ``flush_deferred_writes()`` call.
+        Each chunk is written to the tier(s) chosen by delta-band
+        placement (``_placement_tiers``): NVMe-only, PFS-only, or both.
+        Under full replication (``delta_band >= 1.0``, the default) every
+        chunk is written to all tiers, reproducing the original
+        behaviour.  Writes are optionally deferred until the next
+        ``flush_deferred_writes()`` call.
 
         Args:
             keys: Cache keys for the KV chunks.
             objs: Memory objects containing the KV data.
             transfer_spec: Unused (interface compatibility).
             on_complete_callback: Optional callback invoked per key
-                after that key's disk write completes on both tiers.
+                after that key's disk write completes on all held tiers.
+            placement_hints: Optional per-chunk fractional prefix
+                positions in ``[0, 1]`` (index-aligned with ``keys``),
+                used to drive delta-band placement.  ``None`` => full
+                replication (safe default).
         """
         self._drain_completed()
 
-        for key, memory_obj in zip(keys, objs, strict=False):
+        for idx, (key, memory_obj) in enumerate(
+            zip(keys, objs, strict=False)
+        ):
             assert memory_obj.tensor is not None
 
             if self.exists_in_put_tasks(key):
@@ -886,13 +1039,21 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             fmt = memory_obj.metadata.fmt
             cached_positions = memory_obj.metadata.cached_positions
 
-            # Build file paths for all active tiers (1 or 2)
+            # Decide physical placement (delta-band partial replication).
+            hint: Optional[float] = None
+            if placement_hints is not None and idx < len(placement_hints):
+                hint = placement_hints[idx]
+            held_tiers = self._placement_tiers(hint)
+            self._chunks_written += 1
+            self._tier_writes += len(held_tiers)
+
+            # File paths for the held tiers (index-aligned with held_tiers)
             tier_paths = [
-                self._key_to_path(key, ti)
-                for ti in range(self._num_tiers)
+                self._key_to_path(key, ti) for ti in held_tiers
             ]
             meta = _BlockMeta(
                 tier_paths=tier_paths,
+                tiers=held_tiers,
                 chunk_bytes=required_size,
                 shape=shape,
                 dtype=dtype,
@@ -903,21 +1064,21 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             group = _WriteGroup(
                 key=key,
                 memory_obj=memory_obj,
-                remaining=self._num_tiers,  # one save per tier
+                remaining=len(held_tiers),  # one save per held tier
                 meta=meta,
                 on_complete_callback=on_complete_callback,
             )
 
-            # Build save ops: one per tier, full blob
+            # Build save ops: one per held tier, full blob
             save_ops: list[tuple[Any, str, torch.Tensor, str]] = []
-            for ti in range(self._num_tiers):
+            for ti, path in zip(held_tiers, tier_paths):
                 io_hash = self._next_io_hash(key, f"save_t{ti}")
                 group.io_hashes.append(io_hash)
                 save_ops.append((
                     self._tier_engines[ti],
                     io_hash,
                     raw_tensor,
-                    tier_paths[ti],
+                    path,
                 ))
 
             if self._deferred_writes_enabled:
@@ -1020,9 +1181,15 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
                 self.cache_policy.update_on_hit(key, self.dict)
                 meta: _BlockMeta = self.dict[key]
 
+            # Time the host-buffer allocate (includes CPU-cache eviction
+            # wait / write-back-pressure stalls) on the read path.
+            _t_alloc = time.perf_counter()
             memory_obj = self.local_cpu_backend.allocate(
                 meta.shape, meta.dtype, meta.fmt
             )
+            self._read_alloc_wait_us += (
+                time.perf_counter() - _t_alloc
+            ) * 1e6
             assert memory_obj is not None, (
                 "Memory allocation failed during KVStream "
                 "overlapped load."
@@ -1078,8 +1245,26 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
 
         return results
 
+    def _item_on_tier(self, idx: int, tier_idx: int) -> bool:
+        """Return whether work-item ``idx`` is physically stored on
+        ``tier_idx`` (delta-band membership check).
+
+        Args:
+            idx: Work-item index.
+            tier_idx: Storage tier index.
+
+        Returns:
+            ``True`` if the chunk at ``idx`` resides on ``tier_idx``.
+        """
+        return tier_idx in self._work_items[idx][3].tiers
+
     def _next_cursor_index(self, tier_idx: int) -> Optional[int]:
-        """Advance the tier's cursor, skipping done blocks.
+        """Advance the tier's cursor, skipping done and non-resident blocks.
+
+        A tier only reads chunks it physically holds (delta-band
+        membership): the NVMe cursor skips PFS-only chunks and vice
+        versa.  Chunks replicated on both tiers form the stealable band
+        where the two cursors meet.
 
         Args:
             tier_idx: 0 = NVMe (front, ascending),
@@ -1108,8 +1293,12 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
                 if idx < self._tier_1_start or idx < 0:
                     return None
                 self._pfs_cursor -= 1
-            if idx not in self._done_blocks:
-                return idx
+            # Skip already-served blocks and blocks not on this tier.
+            if idx in self._done_blocks:
+                continue
+            if not self._item_on_tier(idx, tier_idx):
+                continue
+            return idx
 
     def _submit_next_block(self, tier_idx: int) -> bool:
         """Submit the next block from this tier's cursor.
@@ -1127,7 +1316,9 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
 
         group_hash, key, memory_obj, meta = self._work_items[idx]
         io_hash = self._next_io_hash(key, f"load_t{tier_idx}")
-        path = meta.tier_paths[tier_idx]
+        # Path is deterministic from (key, tier); membership already
+        # verified by _next_cursor_index so this tier holds the chunk.
+        path = self._key_to_path(key, tier_idx)
         raw_tensor = memory_obj.raw_tensor
         assert raw_tensor is not None
 
@@ -1366,6 +1557,63 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             "disk_used_gb": round(self.current_cache_size / 1024**3, 3),
             "disk_max_gb": round(self.max_cache_size / 1024**3, 3),
         }
+
+    def get_io_timeline_and_reset(self) -> dict[str, Any]:
+        """Compute overlap-aware read/write timing and reset accumulators.
+
+        Drains each tier engine's per-op (submission_us, completion_us)
+        timeline and derives, per tier, the read-busy time, write-busy
+        time, and their temporal overlap (read/write contention window)
+        via inclusion-exclusion.  Also returns the host-buffer allocate
+        wait accrued on the read path and the effective write
+        amplification (physical tier-writes / logical chunks) since the
+        last call.
+
+        This is the primary overlap-aware instrumentation: it reveals how
+        much of a step's read window ran concurrently with (spilled)
+        writes, which sequential phase timers cannot capture.
+
+        Returns:
+            Dict with ``per_tier`` list and step-level counters.  Empty
+            ``per_tier`` when timeline recording is disabled.
+        """
+        per_tier: list[dict[str, Any]] = []
+        if self._timeline_enabled:
+            IOQueue = self.kvstream_core.IOQueue
+            for i, engine in enumerate(self._tier_engines):
+                reads = engine.drain_timeline(IOQueue.READ)
+                writes = engine.drain_timeline(IOQueue.WRITE)
+                ur = _union_busy_us(reads)
+                uw = _union_busy_us(writes)
+                uall = _union_busy_us(list(reads) + list(writes))
+                overlap = max(0.0, ur + uw - uall)
+                per_tier.append({
+                    "tier": i,
+                    "read_busy_ms": round(ur / 1e3, 2),
+                    "write_busy_ms": round(uw / 1e3, 2),
+                    "rw_overlap_ms": round(overlap / 1e3, 2),
+                    "n_read_ops": len(reads),
+                    "n_write_ops": len(writes),
+                })
+
+        waf = (
+            self._tier_writes / self._chunks_written
+            if self._chunks_written > 0
+            else 0.0
+        )
+        result = {
+            "per_tier": per_tier,
+            "read_alloc_wait_ms": round(self._read_alloc_wait_us / 1e3, 2),
+            "chunks_written": self._chunks_written,
+            "tier_writes": self._tier_writes,
+            "write_amplification": round(waf, 3),
+        }
+
+        # Reset step-level accumulators.
+        self._read_alloc_wait_us = 0.0
+        self._chunks_written = 0
+        self._tier_writes = 0
+        return result
 
     # ------------------------------------------------------------------ #
     #  Close / lifecycle                                                   #
