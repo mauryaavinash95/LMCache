@@ -444,6 +444,13 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         self._placement_pivot: float = (
             self._split_ratios[0] if self._num_tiers > 1 else 1.0
         )
+        # Invert exclusive placement: front-of-prefix -> PFS, tail -> NVMe.
+        # Motivated by CPU caching absorbing the hot front chunks, so the
+        # disk-miss stream skews to the tail; putting the tail on the fast
+        # tier (NVMe) aligns disk demand with bandwidth. Band still on both.
+        self._placement_invert: bool = bool(
+            extra.get("kvstream_placement_invert", False)
+        )
         # Warn once if hints are missing while band placement is requested.
         self._placement_hint_warned: bool = False
 
@@ -549,6 +556,7 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             "steal_batch=%d, deferred_writes=%s, "
             "static_partition=%s, split_ratios=%s, "
             "delta_band=%.3f, placement_pivot=%.3f, "
+            "placement_invert=%s, "
             "timeline_enabled=%s, drain_interval=%.3fs",
             self._num_tiers,
             self._chunk_bytes,
@@ -560,6 +568,7 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             self._split_ratios,
             self._delta_band,
             self._placement_pivot,
+            self._placement_invert,
             self._timeline_enabled,
             drain_interval,
         )
@@ -944,10 +953,16 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         lo = self._placement_pivot - self._delta_band / 2.0
         hi = self._placement_pivot + self._delta_band / 2.0
         p = 0.0 if hint < 0.0 else (1.0 if hint > 1.0 else hint)
+        # Exclusive tiers for the front and tail regions. Default: front on
+        # NVMe (tier 0), tail on PFS (tier 1). Inverted: front on PFS, tail
+        # on NVMe (align the disk-miss-heavy tail with the fast tier).
+        front_tier, tail_tier = (
+            (1, 0) if self._placement_invert else (0, 1)
+        )
         if p < lo:
-            return [0]  # NVMe-only (front of prefix, hot)
+            return [front_tier]
         if p >= hi:
-            return [1]  # PFS-only (tail of prefix, cold)
+            return [tail_tier]
         return [0, 1]  # replicated band (stealable)
 
     @_lmcache_nvtx_annotate

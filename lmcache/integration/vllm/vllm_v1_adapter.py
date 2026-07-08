@@ -580,6 +580,14 @@ class LMCacheConnectorV1Impl:
         self._store_profiling_enabled: bool = bool(
             config.get_extra_config_value("kvstream_store_profiling", False)
         )
+        # Phase-sync probe: force a cuda.synchronize() at end-of-forward so
+        # the async prefill compute is attributed to `forward` instead of
+        # leaking into `store`. ATTRIBUTION-ONLY: it serializes forward/store
+        # overlap, so wall time under this flag is NOT comparable to normal
+        # runs. Gated OFF by default.
+        self._phase_sync_enabled: bool = bool(
+            config.get_extra_config_value("kvstream_phase_sync", False)
+        )
         # Hash tracing (HASH_TRACE lines + the O(chunks x backends)
         # tier-presence probe) is tied to kvstream_step_logging. Exposed
         # as its own flag so the store-profiling study can turn the probe
@@ -617,6 +625,10 @@ class LMCacheConnectorV1Impl:
         self._store_unpin_time: float = 0.0  # lookup_unpin calls
         self._store_call_time: float = 0.0  # lmcache_engine.store() calls
         self._store_emit_time: float = 0.0  # tracer.emit() calls
+        self._store_d2h_time: float = 0.0    # GPU->CPU copy inside store()
+        self._store_alloc_time: float = 0.0  # host-buffer allocate inside store()
+        # End-of-forward sync wait (leaked async prefill compute), seconds.
+        self._step_fwd_sync: float = 0.0
         # Backlog snapshot taken at entry of wait_for_save.
         self._store_backlog_stats: dict = {}
 
@@ -1548,8 +1560,18 @@ class LMCacheConnectorV1Impl:
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
         """Blocking until the KV cache is saved to the connector buffer."""
-        # T4: entry of wait_for_save (= end of GPU forward pass)
-        _t4 = time.perf_counter()
+        # T4: entry of wait_for_save (= end of GPU forward pass).
+        # With phase-sync on, force the async prefill compute to finish here
+        # so it is attributed to `forward` (t4-t3) rather than leaking into
+        # `store` (t5-t4). The sync wait is recorded separately as fwd_sync.
+        _t4_pre = time.perf_counter()
+        self._step_fwd_sync = 0.0
+        if self._phase_sync_enabled and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            _t4 = time.perf_counter()
+            self._step_fwd_sync = _t4 - _t4_pre
+        else:
+            _t4 = _t4_pre
 
         # Reset Phase-1 store-decomposition accumulators for this step and
         # snapshot the write backlog BEFORE the store loop runs (captures
@@ -1558,6 +1580,8 @@ class LMCacheConnectorV1Impl:
         self._store_unpin_time = 0.0
         self._store_call_time = 0.0
         self._store_emit_time = 0.0
+        self._store_d2h_time = 0.0
+        self._store_alloc_time = 0.0
         self._store_backlog_stats = {}
         if self._store_profiling_enabled and self._kvstream_backend is not None:
             try:
@@ -1727,6 +1751,12 @@ class LMCacheConnectorV1Impl:
             )
             if self._store_profiling_enabled:
                 self._store_call_time += time.perf_counter() - _ts
+                # Localize store() into D2H (GPU->CPU) vs host-buffer
+                # allocate, exposed by CacheEngine.last_store_timing.
+                lst = getattr(self.lmcache_engine, "last_store_timing", None)
+                if lst:
+                    self._store_d2h_time += lst.get("d2h_s", 0.0)
+                    self._store_alloc_time += lst.get("alloc_s", 0.0)
 
             # Hash tracing: emit the consolidated JSON log
             _tracer = self.lmcache_engine.hash_tracers.pop(
@@ -1817,9 +1847,14 @@ class LMCacheConnectorV1Impl:
             unpin_ms = self._store_unpin_time * 1e3
             call_ms = self._store_call_time * 1e3
             emit_ms = self._store_emit_time * 1e3
+            d2h_ms = self._store_d2h_time * 1e3
+            alloc_ms = self._store_alloc_time * 1e3
             other_ms = store_ms - (probe_ms + unpin_ms + call_ms + emit_ms)
             store_parts = (
+                f" fwd_sync={self._step_fwd_sync * 1e3:.1f}ms"
                 f" store_call={call_ms:.1f}ms"
+                f" store_d2h={d2h_ms:.1f}ms"
+                f" store_alloc={alloc_ms:.1f}ms"
                 f" store_probe={probe_ms:.1f}ms"
                 f" store_unpin={unpin_ms:.1f}ms"
                 f" store_emit={emit_ms:.1f}ms"

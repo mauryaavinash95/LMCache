@@ -491,6 +491,15 @@ class LMCacheEngine:
         tot_kv_size = 0
         tot_token_num = 0
 
+        # Phase decomposition of store(): host-buffer allocate (incl.
+        # CPU-cache eviction / write-back-pressure), GPU->CPU D2H copy, and
+        # the storage-manager put. Read by the vLLM adapter via
+        # `last_store_timing`. Reset here so early returns report zeros.
+        _store_alloc_s = 0.0
+        _store_d2h_s = 0.0
+        _store_put_s = 0.0
+        self.last_store_timing = {"alloc_s": 0.0, "d2h_s": 0.0, "put_s": 0.0}
+
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
@@ -514,6 +523,7 @@ class LMCacheEngine:
                 # Isolate CPU allocation + synchronous eviction time from
                 # token processing so write-back-pressure stalls (chunks
                 # pinned by in-flight deferred writes) are attributable.
+                _t_alloc = time.perf_counter()
                 with store_stats.profile_allocate():
                     memory_obj = self.storage_manager.allocate(
                         kv_shapes,
@@ -523,6 +533,7 @@ class LMCacheEngine:
                         ),
                         fmt=self.fmt,
                     )
+                _store_alloc_s += time.perf_counter() - _t_alloc
                 if memory_obj is None:
                     store_stats.n_alloc_none += 1
                     logger.warning(
@@ -574,8 +585,10 @@ class LMCacheEngine:
         if not memory_objs:
             return
 
+        _t_d2h = time.perf_counter()
         with store_stats.profile_from_gpu():
             self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
+        _store_d2h_s += time.perf_counter() - _t_d2h
 
         # Per-chunk fractional prefix position in [0, 1] (first chunk -> 0,
         # last -> 1), used by tier-aware backends (e.g. KVStream delta-band
@@ -589,6 +602,7 @@ class LMCacheEngine:
             denom = max(1, total_chunks - 1)
             placement_hints = [(s // chunk_toks) / denom for s in starts]
 
+        _t_put = time.perf_counter()
         with store_stats.profile_put():
             transfer_spec = kwargs.get("transfer_spec", None)
             # TODO: we implicitly rely on batched_put to call ref_count_down
@@ -599,6 +613,14 @@ class LMCacheEngine:
                 transfer_spec=transfer_spec,
                 placement_hints=placement_hints,
             )
+        _store_put_s += time.perf_counter() - _t_put
+
+        # Expose store() phase decomposition for per-step instrumentation.
+        self.last_store_timing = {
+            "alloc_s": _store_alloc_s,
+            "d2h_s": _store_d2h_s,
+            "put_s": _store_put_s,
+        }
 
         self.stats_monitor.on_store_finished(
             store_stats,
