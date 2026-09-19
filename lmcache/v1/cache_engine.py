@@ -1815,7 +1815,8 @@ class LMCacheEngine:
             tokens: Input tokens to process.
             mask: Mask indicating valid token positions.
             ret_mask: Output mask updated with cache hit positions.
-            kvstream_backend: The ``KVStreamDiskBackend`` instance.
+            kvstream_backend: The ``KVStreamBlockReplicatedBackend``
+                instance.
             **kwargs: Additional keyword arguments (must include
                 ``kvcaches``, ``slot_mapping``, etc.).
 
@@ -1823,14 +1824,11 @@ class LMCacheEngine:
             Tuple of (reordered_chunks, total_kv_size).
         """
         # Lazy import to avoid circular dependency at module level
-        from lmcache.v1.storage_backend.kvstream_disk_backend import (
-            KVStreamDiskBackend,
-        )
         from lmcache.v1.storage_backend.kvstream_block_backend import (
             KVStreamBlockReplicatedBackend,
         )
 
-        _KVStreamTypes = (KVStreamDiskBackend, KVStreamBlockReplicatedBackend)
+        _KVStreamTypes = (KVStreamBlockReplicatedBackend,)
 
         assert self.storage_manager is not None
         assert self.gpu_connector is not None
@@ -2086,21 +2084,19 @@ class LMCacheEngine:
             tokens: Input tokens for this request.
             mask: Boolean mask for valid token positions.
             ret_mask: Output mask updated with cache hit positions.
-            kvstream_backend: The ``KVStreamDiskBackend`` instance.
+            kvstream_backend: The ``KVStreamBlockReplicatedBackend``
+                instance.
             **kwargs: Additional arguments (kvcaches, slot_mapping, etc.).
 
         Returns:
             ``OverlappedRetrieveState`` with block_mapping populated
             and disk reads submitted.
         """
-        from lmcache.v1.storage_backend.kvstream_disk_backend import (
-            KVStreamDiskBackend,
-        )
         from lmcache.v1.storage_backend.kvstream_block_backend import (
             KVStreamBlockReplicatedBackend,
         )
 
-        _KVStreamTypes = (KVStreamDiskBackend, KVStreamBlockReplicatedBackend)
+        _KVStreamTypes = (KVStreamBlockReplicatedBackend,)
 
         assert self.storage_manager is not None
 
@@ -2245,7 +2241,8 @@ class LMCacheEngine:
 
         Args:
             state: The retrieve state from earlier phases.
-            kvstream_backend: The ``KVStreamDiskBackend`` instance.
+            kvstream_backend: The ``KVStreamBlockReplicatedBackend``
+                instance.
         """
         if state.total_disk_pending == 0:
             return
@@ -2299,7 +2296,8 @@ class LMCacheEngine:
 
         Args:
             state: The retrieve state from earlier phases.
-            kvstream_backend: The ``KVStreamDiskBackend`` instance.
+            kvstream_backend: The ``KVStreamBlockReplicatedBackend``
+                instance.
             num_required_tokens: Number of tokens the caller expected
                 to retrieve (for logging).
             skip_sync: If ``True``, the caller has already synced
@@ -2308,14 +2306,11 @@ class LMCacheEngine:
         Returns:
             The ``ret_mask`` indicating which tokens were retrieved.
         """
-        from lmcache.v1.storage_backend.kvstream_disk_backend import (
-            KVStreamDiskBackend,
-        )
         from lmcache.v1.storage_backend.kvstream_block_backend import (
             KVStreamBlockReplicatedBackend,
         )
 
-        _KVStreamTypes = (KVStreamDiskBackend, KVStreamBlockReplicatedBackend)
+        _KVStreamTypes = (KVStreamBlockReplicatedBackend,)
 
         assert self.gpu_connector is not None
 

@@ -598,7 +598,7 @@ class LMCacheConnectorV1Impl:
         # Set on first start_load_kv call if the backend has deferred writes
         # enabled.  Used to flush previous step's writes after current
         # step's reads complete.
-        self._kvstream_backend: Optional["KVStreamDiskBackend"] = None  # noqa: F821
+        self._kvstream_backend: Optional["KVStreamBlockReplicatedBackend"] = None  # noqa: F821, E501
         self._kvstream_deferred_checked: bool = False
         # Cross-request overlapped retrieve: submit disk reads for ALL
         # requests before processing any CPU→GPU transfers.
@@ -1336,7 +1336,8 @@ class LMCacheConnectorV1Impl:
         the storage manager.  Subsequent calls go straight to flush.
 
         Accesses ``_deferred_writes_enabled`` directly on the
-        ``KVStreamDiskBackend`` instance to avoid adding a public API
+        ``KVStreamBlockReplicatedBackend`` instance to avoid adding a
+        public API
         for this KVStream-only optimisation.
         """
         if not self._kvstream_deferred_checked:
@@ -1868,6 +1869,18 @@ class LMCacheConnectorV1Impl:
                     f" pin_mb={b.get('pinned_mb', 0)}"
                     f" put_tasks={b.get('put_tasks_len', 0)}"
                     f" disk_fill={b.get('disk_fill', 0)}"
+                )
+                # Per-tier occupancy: shows NVMe/PFS filling and the
+                # demotion/eviction activity that keeps them bounded.
+                tier_fill = b.get("tier_fill") or []
+                tier_used = b.get("tier_used_gb") or []
+                for ti, (fill, used) in enumerate(
+                    zip(tier_fill, tier_used, strict=False)
+                ):
+                    store_parts += f" t{ti}_fill={fill}/{used}GB"
+                store_parts += (
+                    f" pend_del={b.get('pending_delete', 0)}"
+                    f" outst_wr_mb={b.get('outstanding_write_mb', 0)}"
                 )
 
         # Overlap-aware read/write timeline + delta-band write metrics.

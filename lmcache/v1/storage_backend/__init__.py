@@ -200,39 +200,32 @@ def CreateStorageBackends(
         if config.kvstream_enable:
             # Use KVStream (io_uring) as the disk I/O engine instead of
             # the default Python open()/write()/read() thread-pool.
+            # ``block_replicated`` is the only supported placement; the
+            # older layer-striped backend has been removed.
             _extra = config.extra_config or {}
             _placement = str(
-                _extra.get("kvstream_placement", "layer_stripe")
+                _extra.get("kvstream_placement", "block_replicated")
             ).strip().lower()
-
-            if _placement == "block_replicated":
-                # First Party
-                from lmcache.v1.storage_backend.kvstream_block_backend import (
-                    KVStreamBlockReplicatedBackend,
+            if _placement != "block_replicated":
+                logger.warning(
+                    "kvstream_placement=%r is no longer supported; "
+                    "falling back to 'block_replicated'.",
+                    _placement,
                 )
 
-                disk_backend = KVStreamBlockReplicatedBackend(
-                    config,
-                    loop,
-                    local_cpu_backend,
-                    dst_device,
-                    lmcache_worker,
-                    metadata,
-                )
-            else:
-                # First Party
-                from lmcache.v1.storage_backend.kvstream_disk_backend import (
-                    KVStreamDiskBackend,
-                )
+            # First Party
+            from lmcache.v1.storage_backend.kvstream_block_backend import (
+                KVStreamBlockReplicatedBackend,
+            )
 
-                disk_backend = KVStreamDiskBackend(
-                    config,
-                    loop,
-                    local_cpu_backend,
-                    dst_device,
-                    lmcache_worker,
-                    metadata,
-                )
+            disk_backend = KVStreamBlockReplicatedBackend(
+                config,
+                loop,
+                local_cpu_backend,
+                dst_device,
+                lmcache_worker,
+                metadata,
+            )
         else:
             disk_backend = LocalDiskBackend(
                 config,

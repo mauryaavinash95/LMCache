@@ -14,6 +14,7 @@ Activated when ``kvstream_placement = "block_replicated"`` and
 """
 
 # Standard
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
@@ -205,8 +206,12 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         self.loop = loop
 
         # -- Capacity tracking -------------------------------------------
+        # ``max_cache_size`` is the tier-0 (NVMe) budget, expressed
+        # per-rank (each TP rank owns an independent slice of the node's
+        # device).  Tier-1 (PFS) has its own independent per-rank budget
+        # (``kvstream_pfs_cap_gb``); both are wired into ``_tier_cap``
+        # once the tier count is known.
         self.max_cache_size: int = int(config.max_local_disk_size * 1024**3)
-        self.current_cache_size: float = 0.0
         self.usage: int = 0
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
 
@@ -313,6 +318,34 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             self._tier_paths = [self.path]
         self._tier_locking: list[str] = locking_modes[:self._num_tiers]
         self._tier_engines: list[Any] = []
+
+        # -- Per-tier capacity, recency and delete bookkeeping -----------
+        # Each tier is capacity-managed independently: tier 0 (NVMe) uses
+        # ``max_local_disk_size`` and tier 1 (PFS) uses
+        # ``kvstream_pfs_cap_gb``.  Both are **per-rank** budgets so that
+        # the aggregate node/filesystem footprint is the per-rank value
+        # times the number of TP ranks sharing the device.
+        #
+        # Recency is tracked per tier (``_tier_lru``) rather than
+        # globally: a chunk's position in tier *t*'s LRU is refreshed
+        # only when tier *t* actually serves a read for it.  A chunk
+        # repeatedly served from NVMe therefore ages out of the PFS LRU
+        # (and vice versa), so each tier evicts what *it* stopped
+        # serving instead of inheriting the other tier's access pattern.
+        pfs_cap_gb: float = float(
+            extra.get("kvstream_pfs_cap_gb", 1250.0)
+        )
+        self._tier_cap: list[int] = [self.max_cache_size]
+        if self._num_tiers == 2:
+            self._tier_cap.append(int(pfs_cap_gb * 1024**3))
+        self._tier_used: list[int] = [0] * self._num_tiers
+        self._tier_lru: list[OrderedDict[CacheEngineKey, None]] = [
+            OrderedDict() for _ in range(self._num_tiers)
+        ]
+        # Keys whose backing files are being unlinked outside the lock.
+        # Guards against a concurrent write completion re-registering a
+        # key whose (deterministic) path is about to be removed.
+        self._pending_delete: set[CacheEngineKey] = set()
 
         for i in range(self._num_tiers):
             read_chunk_kb = int(
@@ -549,6 +582,16 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             tuple[_WriteGroup, list[tuple[Any, str, torch.Tensor, str]]]
         ] = []
 
+        # -- Write backpressure ------------------------------------------
+        # Cap on bytes pinned by not-yet-durable writes.  <= 0 disables.
+        self._max_outstanding_write_bytes: int = int(
+            float(
+                extra.get("kvstream_max_outstanding_write_mb", 4096.0)
+            )
+            * 1024**2
+        )
+        self._outstanding_write_bytes: int = 0
+
         logger.info(
             "KVStreamBlockReplicatedBackend initialized: "
             "placement=block_replicated, num_tiers=%d, "
@@ -578,7 +621,14 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
     # ------------------------------------------------------------------ #
 
     def __str__(self) -> str:
-        """Return backend name (matches KVStreamDiskBackend for compat)."""
+        """Return the backend's registry/location name.
+
+        Kept as the legacy ``"KVStreamDiskBackend"`` string even though
+        the layer-striped backend of that name has been removed: this
+        value is used as a storage *location* key in block mappings and
+        lookup results, so renaming it would be a cross-cutting change
+        with no functional benefit.
+        """
         return "KVStreamDiskBackend"
 
     def _key_to_path(self, key: CacheEngineKey, tier_idx: int) -> str:
@@ -631,6 +681,28 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
                 self.dict[key].pin()
                 self.keys_in_request.append(key)
             return True
+
+    def touch_cache(self) -> None:
+        """Release lookup pins taken since the last call.
+
+        ``contains(pin=True)`` / ``batched_async_contains(pin=True)``
+        pin every hit so the entry cannot be evicted between the
+        scheduler's lookup and the worker's load.  This drains that
+        list and releases the pins; without it ``pin_count`` grows
+        monotonically and every chunk that was ever a lookup hit
+        becomes permanently unevictable.
+
+        Recency is deliberately **not** refreshed here: per-tier LRU
+        position is driven by which tier actually served a read (see
+        ``_process_read_completions``), so refreshing both tiers on a
+        lookup would erase the distinction between them.
+        """
+        with self.disk_lock:
+            for key in self.keys_in_request:
+                meta = self.dict.get(key)
+                if meta is not None and meta.is_pinned:
+                    meta.unpin()
+            self.keys_in_request = []
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         """Check whether *key* has an in-flight put task.
@@ -702,11 +774,20 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             return True
 
     def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
-        """Remove *key* from the cache (no-op — no evictions).
+        """Remove *key* from every tier and delete its backing files.
+
+        Drops the metadata entry, releases the capacity it accounted
+        for on each tier that held it, and unlinks the on-disk blobs.
+        The unlink happens *after* the metadata lock is released so the
+        lock is never held across filesystem latency (a PFS unlink can
+        take tens of milliseconds); ``_pending_delete`` guards the
+        window against a concurrent write completion re-registering the
+        same (deterministic) path.
 
         Args:
             key: The cache engine key.
-            force: Whether this is a forced removal.
+            force: Whether this is a forced removal.  Ignored — a
+                removal always releases the entry.
 
         Returns:
             ``True`` if the key existed and was removed.
@@ -715,6 +796,11 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             meta = self.dict.pop(key, None)
             if meta is None:
                 return False
+            paths = self._detach_locked(key, meta)
+
+        self._unlink_paths(paths)
+        with self.disk_lock:
+            self._pending_delete.discard(key)
         return True
 
     def get_allocator_backend(self) -> LocalCPUBackend:
@@ -741,6 +827,8 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
                 return None
             self.cache_policy.update_on_hit(key, self.dict)
             meta: _BlockMeta = self.dict[key]
+            # Refresh recency only on the tier that will serve the read.
+            self._touch_tier_locked(key, meta.tiers[0])
 
         memory_obj = self.local_cpu_backend.allocate(
             meta.shape, meta.dtype, meta.fmt
@@ -792,6 +880,258 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
                     "KVStream: put task for %s not found during removal",
                     key,
                 )
+
+    # ------------------------------------------------------------------ #
+    #  Per-tier capacity & eviction                                        #
+    # ------------------------------------------------------------------ #
+
+    def _touch_tiers_locked(
+        self, key: CacheEngineKey, meta: "_BlockMeta"
+    ) -> None:
+        """Mark *key* as most-recently-used on every tier holding it.
+
+        Caller must hold ``disk_lock``.
+
+        Args:
+            key: The cache engine key.
+            meta: Metadata describing which tiers hold the chunk.
+        """
+        for tier in meta.tiers:
+            lru = self._tier_lru[tier]
+            if key in lru:
+                lru.move_to_end(key)
+            else:
+                lru[key] = None
+
+    def _touch_tier_locked(
+        self, key: CacheEngineKey, tier: int
+    ) -> None:
+        """Refresh *key*'s recency on a single tier.
+
+        Called when ``tier`` actually served a read for ``key``.  Only
+        that tier's recency is refreshed, which is what lets the two
+        tiers age independently.
+
+        Caller must hold ``disk_lock``.
+
+        Args:
+            key: The cache engine key.
+            tier: Index of the tier that served the read.
+        """
+        if tier >= len(self._tier_lru):
+            return
+        lru = self._tier_lru[tier]
+        if key in lru:
+            lru.move_to_end(key)
+
+    def _release_tier_reservation_locked(
+        self, meta: "_BlockMeta"
+    ) -> None:
+        """Give back the capacity reserved for a chunk that never landed.
+
+        Caller must hold ``disk_lock``.
+
+        Args:
+            meta: Metadata whose per-tier reservations should be freed.
+        """
+        for tier in meta.tiers:
+            self._tier_used[tier] = max(
+                0, self._tier_used[tier] - meta.chunk_bytes
+            )
+
+    def _detach_locked(
+        self, key: CacheEngineKey, meta: "_BlockMeta"
+    ) -> list[str]:
+        """Detach *key* from all tiers and return its files to unlink.
+
+        Releases per-tier accounting and recency entries and marks the
+        key as pending deletion.  The caller is responsible for calling
+        ``_unlink_paths`` (outside the lock) and then discarding the key
+        from ``_pending_delete``.
+
+        Caller must hold ``disk_lock``.
+
+        Args:
+            key: The cache engine key.
+            meta: Metadata for the chunk being detached.
+
+        Returns:
+            Absolute paths of the backing files to unlink.
+        """
+        paths = []
+        for tier in meta.tiers:
+            self._tier_used[tier] = max(
+                0, self._tier_used[tier] - meta.chunk_bytes
+            )
+            self._tier_lru[tier].pop(key, None)
+            paths.append(self._key_to_path(key, tier))
+        self._pending_delete.add(key)
+        return paths
+
+    def _unlink_paths(self, paths: Sequence[str]) -> None:
+        """Delete backing files, tolerating already-removed entries.
+
+        Args:
+            paths: Absolute file paths to unlink.
+        """
+        for path in paths:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                logger.warning(
+                    "KVStream: failed to unlink %s: %s", path, e
+                )
+
+    def _inflight_read_keys(self) -> set[CacheEngineKey]:
+        """Return keys with a read currently submitted for this step.
+
+        Evicting one of these would unlink a file that an outstanding
+        (or about-to-be-issued) ``open()`` still needs.
+
+        Returns:
+            Set of keys participating in the in-flight read batch.
+        """
+        return {item[1] for item in self._work_items}
+
+    def _evict_tier_locked(
+        self, tier: int, needed_bytes: int
+    ) -> tuple[list[str], list[CacheEngineKey]]:
+        """Free space on *tier* using that tier's own LRU order.
+
+        Victims are taken from the front (least-recently-served) of
+        ``_tier_lru[tier]``.  Chunks that are pinned, have an in-flight
+        write, or belong to the current read batch are skipped.
+
+        Two passes are made.  The first only considers chunks that are
+        also resident on another tier, so the copy on ``tier`` can be
+        dropped while the data stays reachable (a demotion — for tier 0
+        this means "keep the PFS copy, free the NVMe copy").  Only if
+        that cannot free enough space does the second pass evict
+        single-copy chunks, which is a true delete and turns future
+        lookups into misses (the engine then recomputes).
+
+        This method never re-acquires ``disk_lock``; the caller must
+        already hold it and must unlink the returned paths after
+        releasing it.
+
+        Args:
+            tier: Tier index to free space on.
+            needed_bytes: Amount of space required.
+
+        Returns:
+            Tuple of (paths to unlink, keys marked pending-delete by
+            this call).  The caller must discard exactly those keys
+            from ``_pending_delete`` once the unlinks finish.
+        """
+        paths: list[str] = []
+        marked: list[CacheEngineKey] = []
+        freed = 0
+        budget = self._tier_cap[tier] - self._tier_used[tier]
+        if budget >= needed_bytes:
+            return paths, marked
+
+        inflight_reads = self._inflight_read_keys()
+        # Snapshot in-flight writes once: eviction scans many candidates
+        # per step at full cache, and ``exists_in_put_tasks`` is an
+        # O(n) list scan behind a lock.
+        with self.put_tasks_lock:
+            inflight_writes = set(self.put_tasks)
+        for multi_copy_only in (True, False):
+            if budget + freed >= needed_bytes:
+                break
+            for key in list(self._tier_lru[tier].keys()):
+                if budget + freed >= needed_bytes:
+                    break
+                meta = self.dict.get(key)
+                if meta is None:
+                    # Stale recency entry; drop it.
+                    self._tier_lru[tier].pop(key, None)
+                    continue
+                if tier not in meta.tiers:
+                    self._tier_lru[tier].pop(key, None)
+                    continue
+                if not meta.can_evict:
+                    continue
+                if key in self._pending_delete:
+                    continue
+                if key in inflight_reads or key in inflight_writes:
+                    continue
+                has_other_copy = len(meta.tiers) > 1
+                if multi_copy_only != has_other_copy:
+                    continue
+
+                freed += meta.chunk_bytes
+                if has_other_copy:
+                    # Demote: drop this tier's replica only.
+                    paths.append(self._key_to_path(key, tier))
+                    idx = meta.tiers.index(tier)
+                    meta.tiers.pop(idx)
+                    if idx < len(meta.tier_paths):
+                        meta.tier_paths.pop(idx)
+                    self._tier_used[tier] = max(
+                        0, self._tier_used[tier] - meta.chunk_bytes
+                    )
+                    self._tier_lru[tier].pop(key, None)
+                    self._pending_delete.add(key)
+                    marked.append(key)
+                else:
+                    # Last copy: a true eviction.
+                    self.dict.pop(key, None)
+                    paths.extend(self._detach_locked(key, meta))
+                    marked.append(key)
+
+        if budget + freed < needed_bytes:
+            logger.warning(
+                "KVStream: tier %d under pressure — freed %.1f MB of "
+                "%.1f MB requested (used=%.1f GB cap=%.1f GB)",
+                tier,
+                freed / 1e6,
+                needed_bytes / 1e6,
+                self._tier_used[tier] / 1024**3,
+                self._tier_cap[tier] / 1024**3,
+            )
+        return paths, marked
+
+    # ------------------------------------------------------------------ #
+    #  Write backpressure                                                  #
+    # ------------------------------------------------------------------ #
+
+    def _release_outstanding_write(self, group: "_WriteGroup") -> None:
+        """Account for a write group leaving the in-flight set.
+
+        Args:
+            group: The write group that completed or failed.
+        """
+        with self._counter_lock:
+            self._outstanding_write_bytes = max(
+                0,
+                self._outstanding_write_bytes - group.meta.chunk_bytes,
+            )
+
+    def _apply_write_backpressure(self) -> None:
+        """Block until pinned write bytes fall under the configured cap.
+
+        ``submit_writes`` only bounds *kernel* in-flight I/O via the
+        io_uring ring depth; the userspace submit queue in front of it
+        is unbounded, so a store burst that outruns device drain would
+        pin CPU buffers without limit.  Pacing admission here keeps the
+        pinned footprint bounded at the cost of some store latency.
+        """
+        if self._max_outstanding_write_bytes <= 0:
+            return
+        while True:
+            with self._counter_lock:
+                outstanding = self._outstanding_write_bytes
+            if outstanding <= self._max_outstanding_write_bytes:
+                return
+            self._drain_completed()
+            with self._counter_lock:
+                outstanding = self._outstanding_write_bytes
+            if outstanding <= self._max_outstanding_write_bytes:
+                return
+            time.sleep(0.001)
 
     # ------------------------------------------------------------------ #
     #  Background drain thread                                             #
@@ -859,14 +1199,29 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
 
         # Release buffer before registering key
         group.memory_obj.ref_count_down()
+        self._release_outstanding_write(group)
 
         has_stored = False
         with self.disk_lock:
-            if group.key in self.dict:
-                self.cache_policy.update_on_hit(group.key, self.dict)
+            if group.key in self._pending_delete:
+                # The key was evicted while this write was in flight and
+                # its (deterministic) paths are being unlinked right now.
+                # Registering it would advertise a file that is about to
+                # disappear, so drop the result and release the reserved
+                # capacity instead.
+                self._release_tier_reservation_locked(group.meta)
+                logger.debug(
+                    "KVStream: discarding completed write for %s "
+                    "(eviction in progress)",
+                    group.key,
+                )
+            elif group.key in self.dict:
                 has_stored = True
+                self._release_tier_reservation_locked(group.meta)
+                self._touch_tiers_locked(group.key, self.dict[group.key])
             else:
                 self.dict[group.key] = group.meta
+                self._touch_tiers_locked(group.key, group.meta)
 
         self._remove_put_task(group.key)
 
@@ -896,10 +1251,11 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             "KVStream: write failed for key %s", group.key
         )
         group.memory_obj.ref_count_down()
+        self._release_outstanding_write(group)
         self._remove_put_task(group.key)
 
         with self.disk_lock:
-            self.current_cache_size -= group.meta.chunk_bytes
+            self._release_tier_reservation_locked(group.meta)
 
         # Best-effort cleanup of partial files
         for path in group.meta.tier_paths:
@@ -998,6 +1354,7 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
                 replication (safe default).
         """
         self._drain_completed()
+        self._apply_write_backpressure()
 
         for idx, (key, memory_obj) in enumerate(
             zip(keys, objs, strict=False)
@@ -1013,34 +1370,53 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             self._insert_put_task(key)
 
             required_size = memory_obj.get_physical_size()
-            evict_success = True
+
+            # Decide physical placement (delta-band partial replication).
+            hint: Optional[float] = None
+            if placement_hints is not None and idx < len(placement_hints):
+                hint = placement_hints[idx]
+            candidate_tiers = self._placement_tiers(hint)
+
+            # Admit per tier: each tier is capacity-managed independently,
+            # so a full NVMe does not stop the PFS copy from being written
+            # (and vice versa).  A tier that cannot free enough space is
+            # simply dropped from the placement for this chunk.
+            held_tiers: list[int] = []
+            to_unlink: list[str] = []
+            evicted_keys: list[CacheEngineKey] = []
             with self.disk_lock:
-                while (
-                    self.current_cache_size + required_size
-                    > self.max_cache_size
-                ):
-                    evict_keys = (
-                        self.cache_policy.get_evict_candidates(
-                            self.dict, num_candidates=1
+                for tier in candidate_tiers:
+                    if (
+                        self._tier_used[tier] + required_size
+                        > self._tier_cap[tier]
+                    ):
+                        paths, marked = self._evict_tier_locked(
+                            tier, required_size
                         )
-                    )
-                    if not evict_keys:
-                        logger.warning(
-                            "KVStream: no eviction candidates. "
-                            "Disk space under pressure."
-                        )
-                        evict_success = False
-                        break
-                    for evict_key in evict_keys:
-                        self.current_cache_size -= (
-                            self.dict[evict_key].size
-                        )
-                    self.batched_remove(evict_keys, force=False)
+                        to_unlink.extend(paths)
+                        evicted_keys.extend(marked)
+                    if (
+                        self._tier_used[tier] + required_size
+                        <= self._tier_cap[tier]
+                    ):
+                        self._tier_used[tier] += required_size
+                        held_tiers.append(tier)
 
-                if evict_success:
-                    self.current_cache_size += required_size
+            # Unlink outside the lock, then clear the deletion guard.
+            if to_unlink:
+                self._unlink_paths(to_unlink)
+            if evicted_keys:
+                with self.disk_lock:
+                    for evicted in evicted_keys:
+                        self._pending_delete.discard(evicted)
 
-            if not evict_success:
+            if not held_tiers:
+                logger.warning(
+                    "KVStream: no tier could admit chunk %s "
+                    "(%.1f MB); skipping cache insert.",
+                    key,
+                    required_size / 1e6,
+                )
                 self._remove_put_task(key)
                 continue
 
@@ -1054,13 +1430,10 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             fmt = memory_obj.metadata.fmt
             cached_positions = memory_obj.metadata.cached_positions
 
-            # Decide physical placement (delta-band partial replication).
-            hint: Optional[float] = None
-            if placement_hints is not None and idx < len(placement_hints):
-                hint = placement_hints[idx]
-            held_tiers = self._placement_tiers(hint)
             self._chunks_written += 1
             self._tier_writes += len(held_tiers)
+            with self._counter_lock:
+                self._outstanding_write_bytes += required_size
 
             # File paths for the held tiers (index-aligned with held_tiers)
             tier_paths = [
@@ -1438,10 +1811,15 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
                     self._work_items[block_idx]
                 )
 
-                # Recover cached_positions
-                disk_meta: Optional[_BlockMeta] = self.dict.get(
-                    key, None
-                )
+                # Recover cached_positions and refresh recency on the
+                # tier that actually served this read.  Only the winning
+                # tier is touched so the two tiers age independently.
+                with self.disk_lock:
+                    disk_meta: Optional[_BlockMeta] = self.dict.get(
+                        key, None
+                    )
+                    if disk_meta is not None:
+                        self._touch_tier_locked(key, tier_idx)
                 if disk_meta is not None:
                     memory_obj.metadata.cached_positions = (
                         disk_meta.cached_positions
@@ -1537,9 +1915,14 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
                 in-flight writes.
               - ``put_tasks_len``: number of registered (not-yet-final)
                 put tasks.
-              - ``disk_fill``: current_cache_size / max_cache_size for
-                the disk tier (1.0 => disk-tier eviction pressure).
-              - ``disk_used_gb`` / ``disk_max_gb``: raw disk-tier sizes.
+              - ``disk_fill``: tier-0 (NVMe) used/cap ratio
+                (1.0 => NVMe eviction pressure).
+              - ``disk_used_gb`` / ``disk_max_gb``: raw NVMe sizes.
+              - ``tier_fill`` / ``tier_used_gb`` / ``tier_cap_gb``:
+                per-tier occupancy (index 0 = NVMe, 1 = PFS).
+              - ``pending_delete``: keys whose files are being unlinked.
+              - ``outstanding_write_mb``: bytes pinned by not-yet-durable
+                writes (the quantity backpressure bounds).
         """
         # Each in-flight chunk contributes ``_num_tiers`` io_hashes to
         # the map; divide to count logical chunks.
@@ -1558,19 +1941,31 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             pinned_bytes += group.meta.chunk_bytes
         with self.put_tasks_lock:
             put_tasks_len = len(self.put_tasks)
-        disk_fill = (
-            self.current_cache_size / self.max_cache_size
-            if self.max_cache_size > 0
-            else 0.0
-        )
+        with self.disk_lock:
+            tier_used = list(self._tier_used)
+            tier_cap = list(self._tier_cap)
+            n_pending_delete = len(self._pending_delete)
+        tier_fill = [
+            round(u / c, 4) if c > 0 else 0.0
+            for u, c in zip(tier_used, tier_cap, strict=False)
+        ]
+        with self._counter_lock:
+            outstanding = self._outstanding_write_bytes
         return {
             "deferred_queue_len": len(self._deferred_queue),
             "inflight_write_groups": inflight_groups,
             "pinned_mb": round(pinned_bytes / 1e6, 1),
             "put_tasks_len": put_tasks_len,
-            "disk_fill": round(disk_fill, 4),
-            "disk_used_gb": round(self.current_cache_size / 1024**3, 3),
-            "disk_max_gb": round(self.max_cache_size / 1024**3, 3),
+            "disk_fill": tier_fill[0] if tier_fill else 0.0,
+            "disk_used_gb": round(tier_used[0] / 1024**3, 3),
+            "disk_max_gb": round(tier_cap[0] / 1024**3, 3),
+            "tier_fill": tier_fill,
+            "tier_used_gb": [
+                round(u / 1024**3, 3) for u in tier_used
+            ],
+            "tier_cap_gb": [round(c / 1024**3, 3) for c in tier_cap],
+            "pending_delete": n_pending_delete,
+            "outstanding_write_mb": round(outstanding / 1e6, 1),
         }
 
     def get_io_timeline_and_reset(self) -> dict[str, Any]:

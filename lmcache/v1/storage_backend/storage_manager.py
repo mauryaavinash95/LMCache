@@ -1014,8 +1014,12 @@ class StorageManager:
         return block_mapping
 
     def touch_cache(self):
-        for backend_name, backend in self.storage_backends.items():
-            if backend_name == "LocalCPUBackend" or backend_name == "LocalDiskBackend":
+        # Any backend that implements touch_cache participates: it both
+        # refreshes recency and releases the pins taken during lookup.
+        # Gating on a hard-coded name list silently skipped backends
+        # (e.g. KVStream) and leaked their lookup pins.
+        for backend in self.storage_backends.values():
+            if hasattr(backend, "touch_cache"):
                 backend.touch_cache()
 
     def remove(
