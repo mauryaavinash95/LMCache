@@ -347,6 +347,17 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         # key whose (deterministic) path is about to be removed.
         self._pending_delete: set[CacheEngineKey] = set()
 
+        # -- Eviction accounting (monotonic, for observability) ----------
+        # ``pending_delete`` is transient (set and cleared inside a single
+        # store call), and tier occupancy sits flat at the cap once full,
+        # so neither proves that space is actually being reclaimed.  These
+        # counters make reclamation directly measurable and expose the
+        # demote-vs-true-delete split the per-tier design depends on.
+        self._evicted_demoted: int = 0  # replica dropped, data still live
+        self._evicted_deleted: int = 0  # last copy removed -> future miss
+        self._evicted_bytes_freed: int = 0
+        self._files_unlinked: int = 0
+
         for i in range(self._num_tiers):
             read_chunk_kb = int(
                 extra.get(
@@ -978,11 +989,14 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             try:
                 os.remove(path)
             except FileNotFoundError:
-                pass
+                continue
             except OSError as e:
                 logger.warning(
                     "KVStream: failed to unlink %s: %s", path, e
                 )
+                continue
+            with self._counter_lock:
+                self._files_unlinked += 1
 
     def _inflight_read_keys(self) -> set[CacheEngineKey]:
         """Return keys with a read currently submitted for this step.
@@ -1063,6 +1077,12 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
                     continue
 
                 freed += meta.chunk_bytes
+                with self._counter_lock:
+                    self._evicted_bytes_freed += meta.chunk_bytes
+                    if has_other_copy:
+                        self._evicted_demoted += 1
+                    else:
+                        self._evicted_deleted += 1
                 if has_other_copy:
                     # Demote: drop this tier's replica only.
                     paths.append(self._key_to_path(key, tier))
@@ -1923,6 +1943,11 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
               - ``pending_delete``: keys whose files are being unlinked.
               - ``outstanding_write_mb``: bytes pinned by not-yet-durable
                 writes (the quantity backpressure bounds).
+              - ``evicted_demoted`` / ``evicted_deleted``: monotonic counts
+                of replicas dropped (data still reachable on another tier)
+                versus last copies removed (a future lookup miss).
+              - ``evicted_freed_gb`` / ``files_unlinked``: capacity actually
+                reclaimed and backing files actually removed.
         """
         # Each in-flight chunk contributes ``_num_tiers`` io_hashes to
         # the map; divide to count logical chunks.
@@ -1951,7 +1976,15 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         ]
         with self._counter_lock:
             outstanding = self._outstanding_write_bytes
+            demoted = self._evicted_demoted
+            deleted = self._evicted_deleted
+            freed_gb = self._evicted_bytes_freed / 1024**3
+            unlinked = self._files_unlinked
         return {
+            "evicted_demoted": demoted,
+            "evicted_deleted": deleted,
+            "evicted_freed_gb": round(freed_gb, 3),
+            "files_unlinked": unlinked,
             "deferred_queue_len": len(self._deferred_queue),
             "inflight_write_groups": inflight_groups,
             "pinned_mb": round(pinned_bytes / 1e6, 1),

@@ -1882,6 +1882,16 @@ class LMCacheConnectorV1Impl:
                     f" pend_del={b.get('pending_delete', 0)}"
                     f" outst_wr_mb={b.get('outstanding_write_mb', 0)}"
                 )
+                # Monotonic eviction accounting: proves capacity is being
+                # reclaimed (rather than inferring it from a tier that
+                # simply sits pinned at its cap) and shows the
+                # demote-vs-true-delete split.
+                store_parts += (
+                    f" ev_demote={b.get('evicted_demoted', 0)}"
+                    f" ev_delete={b.get('evicted_deleted', 0)}"
+                    f" ev_freed_gb={b.get('evicted_freed_gb', 0)}"
+                    f" unlinked={b.get('files_unlinked', 0)}"
+                )
 
         # Overlap-aware read/write timeline + delta-band write metrics.
         # ``get_io_timeline_and_reset`` drains the C++ per-op intervals for
