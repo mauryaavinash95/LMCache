@@ -1014,10 +1014,15 @@ class StorageManager:
         return block_mapping
 
     def touch_cache(self):
-        # Any backend that implements touch_cache participates: it both
-        # refreshes recency and releases the pins taken during lookup.
-        # Gating on a hard-coded name list silently skipped backends
-        # (e.g. KVStream) and leaked their lookup pins.
+        # Refresh recency for backends that track it. Capability-based
+        # rather than a hard-coded name list so a new backend does not
+        # silently opt out by being unnamed.
+        #
+        # This does NOT release lookup pins: those are owned per request
+        # and released by lookup_unpin. touch_cache runs inside lookup()'s
+        # own finally, before the scheduler has even seen the result, so
+        # releasing here would drop the pin during the window it exists
+        # to cover.
         for backend in self.storage_backends.values():
             if hasattr(backend, "touch_cache"):
                 backend.touch_cache()

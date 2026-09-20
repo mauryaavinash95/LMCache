@@ -2337,59 +2337,6 @@ class LMCacheEngine:
             state.t_cpu_total += time.perf_counter() - t0_cpu
 
     @torch.inference_mode()
-    def drain_disk_blocks(
-        self,
-        state: OverlappedRetrieveState,
-        kvstream_backend: Any,
-    ) -> None:
-        """Phase 3: Drain completed disk reads and transfer to GPU.
-
-        Blocks until all disk chunks for this request complete,
-        issuing ``to_gpu`` on the ``load_stream`` as each chunk
-        becomes ready (completion-driven via ``wait_any_load``).
-
-        Args:
-            state: The retrieve state from earlier phases.
-            kvstream_backend: The ``KVStreamBlockReplicatedBackend``
-                instance.
-        """
-        if state.total_disk_pending == 0:
-            return
-
-        assert self.gpu_connector is not None
-        completed_count = 0
-
-        with torch.cuda.stream(self.gpu_connector.load_stream):
-            while completed_count < state.total_disk_pending:
-                ready = kvstream_backend.wait_any_load()
-                for group_hash, rkey, memory_obj in ready:
-                    t_now = time.perf_counter()
-                    if not state.first_completion_recorded:
-                        state.t_disk_first_completion = (
-                            t_now - state.t0
-                        )
-                        state.first_completion_recorded = True
-                    state.t_disk_last_completion = t_now - state.t0
-
-                    _, start, end = state.group_to_block[
-                        group_hash
-                    ]
-
-                    self.gpu_connector.to_gpu(
-                        memory_obj, start, end, **state.kwargs
-                    )
-
-                    state.reordered_chunks.append(
-                        (rkey, memory_obj, start, end)
-                    )
-                    chunk_size = memory_obj.get_size()
-                    state.tot_kv_size += chunk_size
-                    state.disk_bytes += chunk_size
-                    state.disk_chunks += 1
-                    state.ret_mask[start:end] = True
-                    completed_count += 1
-
-    @torch.inference_mode()
     def finalize_overlapped_retrieve(
         self,
         state: OverlappedRetrieveState,

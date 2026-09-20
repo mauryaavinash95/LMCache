@@ -211,6 +211,7 @@ class RequestTracker:
         lmcache_cached_tokens: int = 0,
         vllm_cached_tokens: int = 0,
         all_token_ids: Optional[list[int]] = None,
+        num_computed_tokens: Optional[int] = None,
     ) -> None:
         """Update the request tracker when a running request is
         scheduled again
@@ -219,6 +220,12 @@ class RequestTracker:
         is only used for preempted requests
         all_token_ids: the full token list from the vLLM request, used to
         restore token_ids for preempted requests to ensure chunk keys match
+        num_computed_tokens: the request's num_computed_tokens at the time
+        ``new_token_ids`` was sliced. ``new_token_ids`` covers positions
+        ``[num_computed_tokens, num_computed_tokens + num_new)``, so this
+        is the position the local copy must be rewound to before extending.
+        Required for correctness whenever vLLM can move that counter
+        backwards; see the note in the non-preempted branch below.
         """
 
         if new_block_ids is None:
@@ -262,6 +269,36 @@ class RequestTracker:
             self.token_ids = all_token_ids[:num_tokens_needed]
         else:
             self.allocated_block_ids.extend(new_block_ids)
+
+            # ``new_token_ids`` is a slice of the request's full token list
+            # starting at num_computed_tokens, so appending is only correct
+            # while that counter advances monotonically.  It does not: when
+            # a KV connector reports blocks it failed to load, vLLM rewinds
+            # num_computed_tokens so those positions are recomputed, and
+            # re-schedules them. The same positions then arrive here a
+            # second time.
+            #
+            # Appending them recorded the same tokens twice while
+            # allocated_block_ids stayed put (vLLM reuses the already
+            # allocated blocks, so new_block_ids is empty), and from then
+            # on token_ids described more tokens than the request had
+            # blocks for.  The next ReqMeta build tripped
+            # ``assert len(slot_mapping) == len(token_ids)`` and killed the
+            # engine -- a load failure of any kind, from any backend, was
+            # fatal one step later.
+            #
+            # Rewinding first makes the update idempotent for positions
+            # already recorded, which is the invariant the slice assumes.
+            if num_computed_tokens is not None:
+                if num_computed_tokens < len(self.token_ids):
+                    logger.debug(
+                        "Request %s rewound from %d to %d computed tokens; "
+                        "discarding the re-scheduled tail before extending",
+                        self.req_id,
+                        len(self.token_ids),
+                        num_computed_tokens,
+                    )
+                del self.token_ids[num_computed_tokens:]
             self.token_ids.extend(new_token_ids)
 
         # When a request is scheduled again, and the number of new tokens
@@ -2414,6 +2451,10 @@ class LMCacheConnectorV1Impl:
                     )
                     all_token_ids = list(vllm_request.all_token_ids)
 
+                # Same rewind hazard as the CachedRequestData path below;
+                # this legacy branch gets the position from the live vLLM
+                # request when one is available.
+                _vreq = self._unfinished_requests.get(req.req_id)
                 request_tracker.update(
                     req.new_token_ids,
                     req.new_block_ids,
@@ -2421,6 +2462,9 @@ class LMCacheConnectorV1Impl:
                     lmcache_cached_tokens=lmcache_cached_tokens,
                     vllm_cached_tokens=vllm_cached_tokens,
                     all_token_ids=all_token_ids,
+                    num_computed_tokens=(
+                        _vreq.num_computed_tokens if _vreq is not None else None
+                    ),
                 )
 
                 req_meta = ReqMeta.from_request_tracker(
@@ -2501,6 +2545,7 @@ class LMCacheConnectorV1Impl:
                 lmcache_cached_tokens=lmcache_cached_tokens,
                 vllm_cached_tokens=vllm_cached_tokens,
                 all_token_ids=all_token_ids,
+                num_computed_tokens=num_current_tokens,
             )
 
             req_meta = ReqMeta.from_request_tracker(
