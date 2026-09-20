@@ -309,9 +309,6 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         global_try_odirect: bool = bool(
             extra.get("kvstream_try_odirect", True)
         )
-        global_max_inflight: int = int(
-            extra.get("kvstream_max_inflight_sqes", 256)
-        )
 
         # -- Import kvstream_core ----------------------------------------
         try:
@@ -421,18 +418,6 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
                     global_write_chunk_kb,
                 )
             )
-            # max_inflight_sqes is the only bound on outstanding work:
-            # the submit queue is unbounded and the ring depth only bounds
-            # the batch between submits. io-wq refuses work it cannot hold
-            # with -ECANCELED instead of queueing it, so this must be set
-            # to something the kernel can absorb.
-            max_inflight = int(
-                extra.get(
-                    f"kvstream_tier_{i}_max_inflight_sqes",
-                    global_max_inflight,
-                )
-            )
-
             engine = kvstream_core.KVStream(
                 read_chunk_size_kb=read_chunk_kb,
                 read_queue_depth=read_qd,
@@ -441,7 +426,6 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
                 max_fds_open=global_max_fds,
                 try_using_odirect=global_try_odirect,
                 max_retries=global_max_retries,
-                max_inflight_sqes=max_inflight,
             )
             self._tier_engines.append(engine)
 
@@ -449,7 +433,7 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             logger.info(
                 "KVStream %s tier %d: path=%s, "
                 "read_chunk_kb=%d, read_qd=%d, write_qd=%d, "
-                "write_chunk_kb=%d, max_inflight_sqes=%d",
+                "write_chunk_kb=%d",
                 tier_label,
                 i,
                 self._tier_paths[i],
@@ -457,7 +441,6 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
                 read_qd,
                 write_qd,
                 write_chunk_kb,
-                max_inflight,
             )
 
         # Convenience alias
