@@ -353,6 +353,8 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         # so neither proves that space is actually being reclaimed.  These
         # counters make reclamation directly measurable and expose the
         # demote-vs-true-delete split the per-tier design depends on.
+        # Reads that failed outright (reported as misses, not fatal).
+        self._read_failures: int = 0
         self._evicted_demoted: int = 0  # replica dropped, data still live
         self._evicted_deleted: int = 0  # last copy removed -> future miss
         self._evicted_bytes_freed: int = 0
@@ -1745,60 +1747,130 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
     @_lmcache_nvtx_annotate
     def wait_any_load(
         self,
-    ) -> list[tuple[str, CacheEngineKey, MemoryObj]]:
-        """Block until at least one chunk completes all I/O.
+    ) -> list[tuple[str, CacheEngineKey, MemoryObj | None]]:
+        """Block until at least one chunk finishes all I/O.
 
         Uses completion-driven reaping with work-stealing: when a
         tier finishes a block, the next block from that tier's cursor
         is immediately submitted.
 
+        Failed reads are reported alongside successful ones, with a
+        ``None`` memory object.  They must be reported: a failed hash is
+        never echoed back as completed, so a caller counting completions
+        would otherwise wait for it forever, and the block's slot in
+        ``_io_hash_to_block``/``_tier_inflight`` would never be released.
+
         Returns:
-            List of ``(group_hash, key, memory_obj)`` for every
-            chunk that completed.
+            List of ``(group_hash, key, memory_obj)``.  ``memory_obj`` is
+            ``None`` for a block whose read failed; the caller must treat
+            that block as *not* retrieved.
         """
-        ready: list[tuple[str, CacheEngineKey, MemoryObj]] = []
+        ready: list[tuple[str, CacheEngineKey, MemoryObj | None]] = []
         io_queue_read = self.kvstream_core.IOQueue.READ
 
-        while not ready:
-            # Phase 1: non-blocking drain from each active engine
-            for ti in range(self._num_tiers):
-                newly_done = self._tier_engines[ti].drain_completed_queue(
-                    io_queue_read
-                )
-                if newly_done:
-                    self._process_read_completions(newly_done, ready)
-
-            if ready:
-                break
-
-            # Phase 2: block on a tier with inflight > 0
-            blocked = False
-            for ti in range(self._num_tiers):
-                if self._tier_inflight[ti] > 0:
-                    torch.cuda.nvtx.range_push(f"kvs_wait_any_t{ti}")
-                    completed = self._tier_engines[
+        try:
+            while not ready:
+                # Phase 1: non-blocking drain from each active engine.
+                # Failures are drained first: they release state that the
+                # completion path would otherwise never free.
+                for ti in range(self._num_tiers):
+                    newly_failed = self._drain_read_failures(ti, ready)
+                    newly_done = self._tier_engines[
                         ti
-                    ].wait_any_completed(io_queue_read)
-                    torch.cuda.nvtx.range_pop()
-                    self._process_read_completions(completed, ready)
-                    blocked = True
+                    ].drain_completed_queue(io_queue_read)
+                    if newly_done:
+                        self._process_read_completions(newly_done, ready)
+                    elif newly_failed:
+                        # Keep the cursor fed even when only failures came
+                        # back, otherwise the pipeline stalls.
+                        self._submit_next_block(ti)
+
+                if ready:
                     break
 
-            if not blocked:
-                logger.error(
-                    "wait_any_load: no tier has inflight reads but "
-                    "%d blocks remain — breaking to avoid hang",
-                    self._pending_count,
-                )
-                break
+                # Phase 2: block on a tier with inflight > 0
+                blocked = False
+                for ti in range(self._num_tiers):
+                    if self._tier_inflight[ti] > 0:
+                        torch.cuda.nvtx.range_push(f"kvs_wait_any_t{ti}")
+                        completed = self._tier_engines[
+                            ti
+                        ].wait_any_completed(io_queue_read)
+                        torch.cuda.nvtx.range_pop()
+                        self._process_read_completions(completed, ready)
+                        blocked = True
+                        break
 
-        # Clean up when all blocks are done
-        if not self._pending_count or len(self._done_blocks) == len(
-            self._work_items
-        ):
-            self._reset_read_state()
+                if not blocked:
+                    logger.error(
+                        "wait_any_load: no tier has inflight reads but "
+                        "%d blocks remain — breaking to avoid hang",
+                        self._pending_count,
+                    )
+                    break
+        finally:
+            # Reset on *every* exit path, not just the clean one.  If an
+            # exception escapes here the per-step work list survives into
+            # the next step, and a later wait_any_load hands the adapter a
+            # group hash from a dead request -- the KeyError cascade that
+            # killed 262 requests.
+            if (
+                not self._pending_count
+                or len(self._done_blocks) == len(self._work_items)
+            ):
+                self._reset_read_state()
 
         return ready
+
+    def _drain_read_failures(
+        self,
+        tier_idx: int,
+        ready: list[tuple[str, CacheEngineKey, MemoryObj | None]],
+    ) -> bool:
+        """Reap failed reads on a tier and release their state.
+
+        Args:
+            tier_idx: Tier to drain.
+            ready: Output list; failed blocks are appended with a
+                ``None`` memory object.
+
+        Returns:
+            ``True`` if any failure was reaped.
+        """
+        engine = self._tier_engines[tier_idx]
+        drain = getattr(engine, "drain_failed_queue", None)
+        if drain is None:
+            # Older kvstream build without the queue-aware drain: read
+            # failures remain unreachable and will surface as a fatal in
+            # wait_any_completed.  Nothing we can do here.
+            return False
+        failed = drain(self.kvstream_core.IOQueue.READ)
+        if not failed:
+            return False
+
+        for io_hash in failed:
+            block_info = self._io_hash_to_block.pop(io_hash, None)
+            if block_info is None:
+                continue
+            block_idx, ti = block_info
+            self._tier_inflight[ti] -= 1
+            with self._counter_lock:
+                self._read_failures += 1
+            if block_idx in self._done_blocks:
+                # The other tier already served this block; the failure
+                # is harmless (replicated chunk, one copy was enough).
+                continue
+            self._done_blocks.add(block_idx)
+            self._pending_count -= 1
+            group_hash, key, _mem, _meta = self._work_items[block_idx]
+            logger.warning(
+                "KVStream: read failed for %s on tier %d; reporting the "
+                "block as not retrieved so the engine recomputes it",
+                key,
+                ti,
+            )
+            ready.append((group_hash, key, None))
+        return True
 
     def _process_read_completions(
         self,
@@ -1940,6 +2012,8 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
               - ``disk_used_gb`` / ``disk_max_gb``: raw NVMe sizes.
               - ``tier_fill`` / ``tier_used_gb`` / ``tier_cap_gb``:
                 per-tier occupancy (index 0 = NVMe, 1 = PFS).
+              - ``read_failures``: reads reported as misses rather than
+                killing the worker (see wait_any_load).
               - ``pending_delete``: keys whose files are being unlinked.
               - ``outstanding_write_mb``: bytes pinned by not-yet-durable
                 writes (the quantity backpressure bounds).
@@ -1977,10 +2051,12 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         with self._counter_lock:
             outstanding = self._outstanding_write_bytes
             demoted = self._evicted_demoted
+            read_failures = self._read_failures
             deleted = self._evicted_deleted
             freed_gb = self._evicted_bytes_freed / 1024**3
             unlinked = self._files_unlinked
         return {
+            "read_failures": read_failures,
             "evicted_demoted": demoted,
             "evicted_deleted": deleted,
             "evicted_freed_gb": round(freed_gb, 3),

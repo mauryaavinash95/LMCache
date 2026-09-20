@@ -1240,6 +1240,7 @@ class LMCacheConnectorV1Impl:
             total_global_pending += state.total_disk_pending
 
         completed_global = 0
+        failed_states: set[int] = set()
         if total_global_pending > 0:
             with torch.cuda.stream(gpu_conn.load_stream):
                 while completed_global < total_global_pending:
@@ -1247,7 +1248,29 @@ class LMCacheConnectorV1Impl:
                     for (
                         group_hash, rkey, memory_obj
                     ) in ready:
-                        tgt = group_to_state[group_hash]
+                        tgt = group_to_state.get(group_hash)
+                        if tgt is None:
+                            # A group hash from a request that is no
+                            # longer in flight.  Never fatal: count it so
+                            # the loop can terminate and move on.
+                            logger.warning(
+                                "Overlapped retrieve: unknown group "
+                                "hash %s (stale read); ignoring",
+                                group_hash,
+                            )
+                            completed_global += 1
+                            continue
+                        if memory_obj is None:
+                            # The read failed.  Mark the whole request as
+                            # un-retrieved rather than leaving a hole in
+                            # ret_mask: vLLM expresses a prefix hit as a
+                            # single token count, so a gap in the middle
+                            # cannot be represented and would silently
+                            # present garbage KV as cached.  Recomputing
+                            # one prefix is cheap next to that.
+                            failed_states.add(id(tgt))
+                            completed_global += 1
+                            continue
                         t_now = time.perf_counter()
                         if not tgt.first_completion_recorded:
                             tgt.t_disk_first_completion = (
@@ -1282,6 +1305,10 @@ class LMCacheConnectorV1Impl:
 
         # ---- Phase 4: finalize ALL requests ----
         for request, state, num_expected in request_states:
+            if id(state) in failed_states:
+                # At least one chunk of this request could not be read.
+                # Drop the whole prefix so the engine recomputes it.
+                state.ret_mask[:] = False
             lmcache_cached_tokens = (
                 request.load_spec.lmcache_cached_tokens
             )
@@ -1891,6 +1918,10 @@ class LMCacheConnectorV1Impl:
                     f" ev_delete={b.get('evicted_deleted', 0)}"
                     f" ev_freed_gb={b.get('evicted_freed_gb', 0)}"
                     f" unlinked={b.get('files_unlinked', 0)}"
+                    # Reads reported as misses instead of killing the
+                    # worker.  Should stay at 0; a rising count means the
+                    # transient I/O errors are actually a rate.
+                    f" rd_fail={b.get('read_failures', 0)}"
                 )
 
         # Overlap-aware read/write timeline + delta-band write metrics.
