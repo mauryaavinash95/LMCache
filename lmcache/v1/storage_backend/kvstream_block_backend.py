@@ -50,6 +50,59 @@ logger = init_logger(__name__)
 # ======================================================================== #
 
 
+def _read_failure_tag(error_msg: str) -> str:
+    """Bucket a kvstream error string into a short, stable reason tag.
+
+    The engine classifies every failure, but the full strings embed paths,
+    offsets and byte counts, so they cannot be aggregated as-is.  These
+    tags are what gets emitted per step; each one points at a different
+    root cause:
+
+    ``nofile``
+        The chunk's file does not exist. Metadata and disk disagree.
+    ``zerolen``
+        The file exists but read 0 bytes at this offset -- truncated, or
+        a write that never actually landed.
+    ``unaligned``
+        A short I/O left an O_DIRECT-unaligned remainder.
+    ``retries``
+        Short I/O that made real progress but never finished.
+    ``sqe``
+        The kernel returned an error; the string carries the errno.
+    ``overwrite``
+        The device returned more bytes than requested.
+    ``ringfull``
+        Could not obtain an SQE to resubmit (submission-queue pressure).
+    ``other`` / ``unknown``
+        Unrecognised, or an engine too old to report a reason.
+
+    Args:
+        error_msg: Raw error string from the engine, possibly empty.
+
+    Returns:
+        A short lowercase tag suitable for use as a histogram key.
+    """
+    if not error_msg:
+        return "unknown"
+    m = error_msg.lower()
+    if "does not exist" in m:
+        return "nofile"
+    if "zero-length" in m:
+        return "zerolen"
+    if "unaligned" in m:
+        return "unaligned"
+    if "retries exhausted" in m:
+        return "retries"
+    if "failed to get sqe" in m:
+        return "ringfull"
+    if "overwrite" in m:
+        return "overwrite"
+    if "sqe error" in m:
+        # Keep the errno: ENOENT vs EIO vs EINVAL are different bugs.
+        return "sqe:" + error_msg.split("SQE error:")[-1].strip().lower()
+    return "other"
+
+
 def _union_busy_us(intervals: list[tuple[float, float]]) -> float:
     """Return the total wall-time (us) covered by the union of intervals.
 
@@ -119,7 +172,19 @@ class _BlockMeta:
         return True
 
     def unpin(self) -> bool:
-        """Decrement pin count."""
+        """Decrement pin count, never below zero.
+
+        Returns:
+            ``True`` if a pin was released, ``False`` if already at zero.
+        """
+        # Floored deliberately.  An unmatched release used to drive the
+        # count negative, after which ``is_pinned`` could never become
+        # true again and the entry was permanently evictable -- the pin
+        # silently stopped protecting anything.  Saturating instead keeps
+        # a bookkeeping bug from disabling the mechanism.
+        if self.pin_count <= 0:
+            self.pin_count = 0
+            return False
         self.pin_count -= 1
         return True
 
@@ -355,6 +420,12 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         # demote-vs-true-delete split the per-tier design depends on.
         # Reads that failed outright (reported as misses, not fatal).
         self._read_failures: int = 0
+        # Histogram of *why* reads failed, keyed by a short reason tag
+        # derived from the engine's error string.  A bare count cannot
+        # distinguish a missing file from a kernel error from an
+        # exhausted retry budget, and those have completely different
+        # fixes; the engine already classifies them, so surface it.
+        self._read_failure_reasons: dict[str, int] = {}
         self._evicted_demoted: int = 0  # replica dropped, data still live
         self._evicted_deleted: int = 0  # last copy removed -> future miss
         self._evicted_bytes_freed: int = 0
@@ -548,6 +619,13 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         ] = []
         # io_hash -> (work_items_index, tier_index)
         self._io_hash_to_block: dict[str, tuple[int, int]] = {}
+        # Keys whose read buffer *this* batch published into the CPU
+        # backend's hot cache.  ``submit_put_task`` returns None both when
+        # it stores and when the key was already present, so the publisher
+        # cannot otherwise tell whether hot_cache[key] is its buffer.  On
+        # a read failure only a key we published may be evicted -- doing
+        # it blindly would drop another request's valid entry.
+        self._published_keys: set[CacheEngineKey] = set()
         # Completed block indices (first-wins semantics)
         self._done_blocks: set[int] = set()
         # Per-tier inflight read count
@@ -696,14 +774,21 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             return True
 
     def touch_cache(self) -> None:
-        """Release lookup pins taken since the last call.
+        """Clear the per-lookup key list. Does **not** release pins.
 
-        ``contains(pin=True)`` / ``batched_async_contains(pin=True)``
-        pin every hit so the entry cannot be evicted between the
-        scheduler's lookup and the worker's load.  This drains that
-        list and releases the pins; without it ``pin_count`` grows
-        monotonically and every chunk that was ever a lookup hit
-        becomes permanently unevictable.
+        ``contains(pin=True)`` pins every hit so the entry survives from
+        the scheduler's lookup until the worker actually loads it.  That
+        window spans at least one engine step, and ``touch_cache`` is
+        called inside ``lookup()``'s own ``finally`` -- before the result
+        has even been returned to the scheduler.  Releasing here therefore
+        protected nothing, and because ``lookup_unpin`` releases the same
+        pin again at the end of the request it also double-released,
+        driving ``pin_count`` negative and disabling eviction protection
+        entirely.
+
+        Ownership now matches ``LocalDiskBackend``: pin at ``contains``,
+        release once at ``lookup_unpin`` (and at ``request_finished`` for
+        requests that never reach the store path).
 
         Recency is deliberately **not** refreshed here: per-tier LRU
         position is driven by which tier actually served a read (see
@@ -711,10 +796,6 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         lookup would erase the distinction between them.
         """
         with self.disk_lock:
-            for key in self.keys_in_request:
-                meta = self.dict.get(key)
-                if meta is not None and meta.is_pinned:
-                    meta.unpin()
             self.keys_in_request = []
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
@@ -1491,17 +1572,33 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
                     path,
                 ))
 
-            if self._deferred_writes_enabled:
-                self._deferred_queue.append((group, save_ops))
+            # Register BEFORE handing anything to io_uring, and under the
+            # same lock the drain thread uses to pop.
+            #
+            # The immediate path used to call engine.save() first and
+            # register afterwards.  engine.save() publishes the hash to the
+            # io_uring submit queue, so a write that completed inside that
+            # window was popped by the drain thread as ``None`` and
+            # silently discarded: group.remaining never reached 0, so
+            # _resolve_completed_write never ran, so the chunk never
+            # entered self.dict (a permanently lost write), its
+            # memory_obj.ref_count_down() never happened, and its tier
+            # capacity reservation was never released.  Registering first
+            # closes the window; taking _drain_lock makes the map's
+            # writer/reader pair actually mutually exclusive, which it was
+            # not -- the drain thread popped under the lock while this
+            # thread inserted without it.
+            with self._drain_lock:
                 for h in group.io_hashes:
                     self._hash_to_write_group[h] = group
+
+            if self._deferred_writes_enabled:
+                self._deferred_queue.append((group, save_ops))
             else:
                 for engine, io_hash, tensor, path in save_ops:
                     torch.cuda.nvtx.range_push("kvs_save_imm")
                     engine.save(io_hash, tensor, path, 0)
                     torch.cuda.nvtx.range_pop()
-                for h in group.io_hashes:
-                    self._hash_to_write_group[h] = group
 
     @_lmcache_nvtx_annotate
     def flush_deferred_writes(self) -> int:
@@ -1611,6 +1708,19 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             self._work_items.append(
                 (group_hash, key, memory_obj, meta)
             )
+            # Publishing before the data lands lets a concurrent request
+            # share this in-flight buffer instead of issuing a duplicate
+            # read.  It also means a *failed* read leaves a valid key
+            # pointing at garbage, so the failure path must retract it --
+            # see _drain_read_failures.
+            #
+            # ponytail: the contains()/submit_put_task() pair is not atomic.
+            # It is safe today because both the read submission and the
+            # store path run on the vLLM worker thread, and no other thread
+            # inserts into hot_cache.  If insertion ever becomes concurrent,
+            # have submit_put_task report whether it stored instead.
+            if not self.local_cpu_backend.contains(key):
+                self._published_keys.add(key)
             self.local_cpu_backend.submit_put_task(key, memory_obj)
             results.append((group_hash, key, memory_obj))
 
@@ -1838,17 +1948,24 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             ``True`` if any failure was reaped.
         """
         engine = self._tier_engines[tier_idx]
-        drain = getattr(engine, "drain_failed_queue", None)
-        if drain is None:
-            # Older kvstream build without the queue-aware drain: read
-            # failures remain unreachable and will surface as a fatal in
-            # wait_any_completed.  Nothing we can do here.
-            return False
-        failed = drain(self.kvstream_core.IOQueue.READ)
+        # Prefer the detailed drain: a bare hash says a read failed but not
+        # why, and the four classes (missing file, kernel error, zero-length
+        # I/O, retries exhausted) need completely different fixes.
+        detailed = getattr(engine, "drain_failed_detailed_queue", None)
+        if detailed is not None:
+            failed = detailed(self.kvstream_core.IOQueue.READ)
+        else:
+            drain = getattr(engine, "drain_failed_queue", None)
+            if drain is None:
+                # Older kvstream build without the queue-aware drain: read
+                # failures remain unreachable and will surface as a fatal in
+                # wait_any_completed.  Nothing we can do here.
+                return False
+            failed = [(h, "") for h in drain(self.kvstream_core.IOQueue.READ)]
         if not failed:
             return False
 
-        for io_hash in failed:
+        for io_hash, error_msg in failed:
             block_info = self._io_hash_to_block.pop(io_hash, None)
             if block_info is None:
                 continue
@@ -1856,21 +1973,64 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             self._tier_inflight[ti] -= 1
             with self._counter_lock:
                 self._read_failures += 1
+                tag = _read_failure_tag(error_msg)
+                self._read_failure_reasons[tag] = (
+                    self._read_failure_reasons.get(tag, 0) + 1
+                )
             if block_idx in self._done_blocks:
                 # The other tier already served this block; the failure
                 # is harmless (replicated chunk, one copy was enough).
                 continue
             self._done_blocks.add(block_idx)
             self._pending_count -= 1
-            group_hash, key, _mem, _meta = self._work_items[block_idx]
+            group_hash, key, memory_obj, _meta = self._work_items[block_idx]
             logger.warning(
-                "KVStream: read failed for %s on tier %d; reporting the "
-                "block as not retrieved so the engine recomputes it",
+                "KVStream: read failed for %s on tier %d (%s); reporting "
+                "the block as not retrieved so the engine recomputes it",
                 key,
                 ti,
+                error_msg or "no reason reported",
             )
+            # Retract the buffer.  submit_batch_load published it into the
+            # CPU hot cache *before* the data landed, so leaving it there
+            # advertises a valid key backed by whatever garbage the failed
+            # read left behind -- a later CPU hit would serve that as KV.
+            # Releasing it also matters for liveness: the consumer skips
+            # failed blocks, so nothing else ever drops these references,
+            # and each leak permanently removes one buffer from the
+            # evictable pool that allocate() busy-waits on.
+            self._release_failed_read_buffer(key, memory_obj)
             ready.append((group_hash, key, None))
         return True
+
+    def _release_failed_read_buffer(
+        self,
+        key: CacheEngineKey,
+        memory_obj: MemoryObj,
+    ) -> None:
+        """Retract a read buffer whose disk read failed.
+
+        Undoes exactly what ``submit_batch_load`` did for this block: the
+        hot-cache publication (if this batch performed it) and the
+        allocation reference.
+
+        Args:
+            key: Chunk key the failed read was for.
+            memory_obj: The buffer allocated for that read.
+        """
+        try:
+            if key in self._published_keys:
+                self._published_keys.discard(key)
+                # Drops the hot_cache entry and the reference it held.
+                self.local_cpu_backend.remove(key)
+            # Drops the allocate() reference held by this batch.
+            memory_obj.ref_count_down()
+        except Exception:
+            # Never let buffer bookkeeping turn a recoverable read failure
+            # into a fatal: the caller still needs to report the miss.
+            logger.exception(
+                "KVStream: failed to retract read buffer for %s", key
+            )
 
     def _process_read_completions(
         self,
@@ -1928,6 +2088,7 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         self._work_items.clear()
         self._io_hash_to_block.clear()
         self._done_blocks.clear()
+        self._published_keys.clear()
         self._tier_inflight = [0] * self._num_tiers
         self._nvme_cursor = 0
         self._pfs_cursor = -1
@@ -1979,6 +2140,13 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
                 "read_bw_mb_s": round(rs.bandwidth_mb_s(), 1),
                 "read_elapsed_ms": round(rs.elapsed_us() / 1e3, 2),
                 "read_retries": rs.total_retries,
+                # Failure-diagnosis counters.  read_retries alone already
+                # separates the classes: a zero-length read burns
+                # max_retries per failure, an unaligned remainder burns
+                # exactly one, and a hard kernel error burns none.
+                "read_ops_failed": rs.total_ops_failed,
+                "read_sqes_submitted": rs.total_sqes_submitted,
+                "read_ring_full_waits": rs.ring_full_waits,
                 "write_bytes": ws.total_bytes_completed,
                 "write_ops": ws.total_ops_completed,
                 "write_bw_mb_s": round(ws.bandwidth_mb_s(), 1),
@@ -2014,6 +2182,9 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
                 per-tier occupancy (index 0 = NVMe, 1 = PFS).
               - ``read_failures``: reads reported as misses rather than
                 killing the worker (see wait_any_load).
+              - ``read_failure_reasons``: ``{tag: count}`` breakdown of
+                those failures (see ``_read_failure_tag``).  A bare count
+                cannot distinguish a missing file from a kernel error.
               - ``pending_delete``: keys whose files are being unlinked.
               - ``outstanding_write_mb``: bytes pinned by not-yet-durable
                 writes (the quantity backpressure bounds).
@@ -2025,19 +2196,27 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         """
         # Each in-flight chunk contributes ``_num_tiers`` io_hashes to
         # the map; divide to count logical chunks.
-        n_io_hashes = len(self._hash_to_write_group)
+        #
+        # Under _drain_lock: the drain thread pops from this map, so
+        # iterating it unlocked raced and could raise "dictionary changed
+        # size during iteration" out of a stats call -- which the caller
+        # only guards against AttributeError, so it killed the step.
+        # Taken on its own here (no other lock held) so this cannot
+        # participate in a cycle with the drain thread's
+        # _drain_lock -> disk_lock ordering.
+        seen: set[int] = set()
+        pinned_bytes = 0
+        with self._drain_lock:
+            n_io_hashes = len(self._hash_to_write_group)
+            for group in self._hash_to_write_group.values():
+                gid = id(group)
+                if gid in seen:
+                    continue
+                seen.add(gid)
+                pinned_bytes += group.meta.chunk_bytes
         inflight_groups = (
             n_io_hashes // self._num_tiers if self._num_tiers else n_io_hashes
         )
-        # Sum pinned bytes over the *unique* in-flight write groups.
-        seen: set[int] = set()
-        pinned_bytes = 0
-        for group in self._hash_to_write_group.values():
-            gid = id(group)
-            if gid in seen:
-                continue
-            seen.add(gid)
-            pinned_bytes += group.meta.chunk_bytes
         with self.put_tasks_lock:
             put_tasks_len = len(self.put_tasks)
         with self.disk_lock:
@@ -2052,11 +2231,13 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
             outstanding = self._outstanding_write_bytes
             demoted = self._evicted_demoted
             read_failures = self._read_failures
+            read_failure_reasons = dict(self._read_failure_reasons)
             deleted = self._evicted_deleted
             freed_gb = self._evicted_bytes_freed / 1024**3
             unlinked = self._files_unlinked
         return {
             "read_failures": read_failures,
+            "read_failure_reasons": read_failure_reasons,
             "evicted_demoted": demoted,
             "evicted_deleted": deleted,
             "evicted_freed_gb": round(freed_gb, 3),

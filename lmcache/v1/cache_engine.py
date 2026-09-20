@@ -73,6 +73,71 @@ ProcessedChunk = Tuple[CacheEngineKey, MemoryObj, int, int]
 ProcessTokensInternalResult = Tuple[List[ProcessedChunk], int]
 
 
+def earliest_failed_start(current: Optional[int], start: int) -> int:
+    """Fold a newly-failed block's start offset into the running minimum.
+
+    A retrieval result is handed to vLLM as a *token count*, so the only
+    shape it can express is "the first N tokens are cached".  The mask must
+    therefore be truncated at the **earliest** failure: truncating at a
+    later one would leave any chunk that loaded successfully in between
+    marked as retrieved, while the earlier failed range stays unset --
+    a hole in the middle of the prefix, which vLLM would read as valid KV.
+
+    Blocks are visited grouped by storage location rather than in token
+    order, so "earliest" is not simply "first seen".
+
+    Args:
+        current: Running minimum, or ``None`` if nothing has failed yet.
+        start: Start offset of the block that just failed.
+
+    Returns:
+        The smaller of ``current`` and ``start``.
+    """
+    return start if current is None or start < current else current
+
+
+def truncate_to_prefix(
+    ret_mask: torch.Tensor,
+    reordered_chunks: List[ProcessedChunk],
+    tot_kv_size: int,
+    last_failed_block_start: Optional[int],
+) -> Tuple[List[ProcessedChunk], int]:
+    """Cut a partially-retrieved result back to a contiguous prefix.
+
+    Clears ``ret_mask`` from the first failure onwards and drops every
+    chunk that is no longer covered, releasing each dropped chunk's
+    reference.  Callers only ``ref_count_down`` the chunks they get back,
+    so a chunk filtered out here without a release would be leaked --
+    permanently, since a buffer at ``ref_count > 1`` can never be evicted.
+
+    Args:
+        ret_mask: Per-token retrieved mask; modified in place.
+        reordered_chunks: Chunks retrieved so far.
+        tot_kv_size: Running byte total for ``reordered_chunks``.
+        last_failed_block_start: Earliest failed start, or ``None``.
+
+    Returns:
+        ``(kept_chunks, adjusted_tot_kv_size)``.  Unchanged when
+        ``last_failed_block_start`` is ``None``.
+    """
+    if last_failed_block_start is None:
+        return reordered_chunks, tot_kv_size
+
+    ret_mask[last_failed_block_start:] = False
+
+    kept: List[ProcessedChunk] = []
+    for key, memory_obj, start, end in reordered_chunks:
+        # ``end`` is exclusive, so a chunk ending exactly at the cut is
+        # still fully inside the surviving prefix.  Using ``<`` here
+        # discarded one extra good chunk and leaked its reference.
+        if end <= last_failed_block_start:
+            kept.append((key, memory_obj, start, end))
+        else:
+            tot_kv_size -= memory_obj.get_size()
+            memory_obj.ref_count_down()
+    return kept, tot_kv_size
+
+
 @dataclass
 class OverlappedRetrieveState:
     """Per-request state for cross-request overlapped retrieve.
@@ -241,6 +306,20 @@ class LMCacheEngine:
         self.lookup_pins: dict[str, dict[str, list]] = defaultdict(
             lambda: defaultdict(list)
         )
+        # Upper bound on simultaneously-pinned lookups.  Entries are
+        # normally released by ``lookup_unpin`` once the request reaches
+        # the store path, but a request that is looked up and then aborted
+        # before it is ever scheduled never gets there, and in the default
+        # (non-bypass) deployment the pins live in the worker process while
+        # the abort is only visible to the scheduler -- there is no channel
+        # to forward it.  The scheduler cannot have more live un-scheduled
+        # requests than its queue depth, so anything beyond this many
+        # entries is orphaned by definition.
+        #
+        # ponytail: fixed cap with oldest-first release.  If an unpin RPC
+        # is ever added to the lookup client, drive release from the abort
+        # signal instead and delete this.
+        self._max_lookup_pins: int = 1024
 
         InitializeUsageContext(config, metadata)
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
@@ -1268,7 +1347,20 @@ class LMCacheEngine:
                     assert lookup_id is not None, (
                         "lookup_id is required when pin is True"
                     )
+                    # Release any pins from a previous lookup with this id
+                    # before overwriting.  The scheduler re-looks-up a
+                    # request it could not schedule, and each attempt pins
+                    # again; a plain assignment dropped the only handle to
+                    # the earlier pin set, orphaning those pins for the
+                    # lifetime of the process.
+                    #
+                    # Guarded on presence so this cannot fall through to
+                    # lookup_unpin's async-loading cleanup branch, which
+                    # would cancel an in-flight prefetch for this very id.
+                    if lookup_id in self.lookup_pins:
+                        self.lookup_unpin(lookup_id)
                     self.lookup_pins[lookup_id] = block_mapping
+                    self._release_orphaned_lookup_pins()
                 for idx, (start, end, key) in enumerate(chunk_info_list):
                     if idx < hit_chunks:
                         res = end
@@ -1552,6 +1644,42 @@ class LMCacheEngine:
 
         return num_tokens
 
+    def _release_orphaned_lookup_pins(self) -> None:
+        """Release the oldest lookup pin sets once the map exceeds its cap.
+
+        Safety net for lookups whose request never reaches the store path
+        (aborted or never scheduled) and therefore never calls
+        ``lookup_unpin``.  Without it those pins are held for the lifetime
+        of the process and the chunks they cover can never be evicted.
+
+        Insertion order is release order: ``lookup_pins`` is a plain dict,
+        which preserves it, and the oldest surviving entry is by definition
+        the one least likely to still be waiting to be scheduled.
+
+        Tolerant of concurrent mutation: this runs on the lookup-server
+        thread while ``lookup_unpin`` runs on the worker thread, and the
+        map is not lock-protected (pre-existing).  A key that disappears
+        mid-loop just ends the sweep; the next lookup retries.
+        """
+        while len(self.lookup_pins) > self._max_lookup_pins:
+            try:
+                oldest = next(iter(self.lookup_pins))
+            except (StopIteration, RuntimeError):
+                # Emptied or resized by the worker thread; nothing to do.
+                break
+            logger.warning(
+                "lookup_pins exceeded %d entries; releasing pins for "
+                "orphaned lookup %s (request was never scheduled or "
+                "stored)",
+                self._max_lookup_pins,
+                oldest,
+            )
+            self.lookup_unpin(oldest)
+            # lookup_unpin is a no-op for ids not in the map; guard
+            # against an unbounded loop if that ever becomes possible.
+            if oldest in self.lookup_pins:
+                del self.lookup_pins[oldest]
+
     @_lmcache_nvtx_annotate
     def lookup_unpin(self, lookup_id: str) -> None:
         if lookup_id in self.lookup_pins:
@@ -1768,24 +1896,17 @@ class LMCacheEngine:
                     logger.warning(
                         "The cache block is in the storage, but it can't be retrieved"
                     )
-                    if (
-                        last_failed_block_start is None
-                        or last_failed_block_start < start
-                    ):
-                        last_failed_block_start = start
+                    last_failed_block_start = earliest_failed_start(
+                        last_failed_block_start, start
+                    )
                     break
                 reordered_chunks.append((key, memory_obj, start, end))
                 tot_kv_size += memory_obj.get_size()
                 ret_mask[start:end] = True
 
-        if last_failed_block_start is not None:
-            ret_mask[last_failed_block_start:] = False
-
-            reordered_chunks = [
-                (key, memory_obj, start, end)
-                for key, memory_obj, start, end in reordered_chunks
-                if end < last_failed_block_start
-            ]
+        reordered_chunks, tot_kv_size = truncate_to_prefix(
+            ret_mask, reordered_chunks, tot_kv_size, last_failed_block_start
+        )
         return reordered_chunks, tot_kv_size
 
     @_lmcache_nvtx_annotate
@@ -1901,11 +2022,9 @@ class LMCacheEngine:
                             "KVStream overlapped: key missing "
                             "from disk cache during load"
                         )
-                        if (
-                            last_failed_block_start is None
-                            or last_failed_block_start < start
-                        ):
-                            last_failed_block_start = start
+                        last_failed_block_start = earliest_failed_start(
+                            last_failed_block_start, start
+                        )
                         break
                     io_hash, _, _memory_obj = entry
                     group_to_block[io_hash] = (key, start, end)
@@ -1971,11 +2090,9 @@ class LMCacheEngine:
                                 "The cache block is in the storage, "
                                 "but it can't be retrieved"
                             )
-                            if (
-                                last_failed_block_start is None
-                                or last_failed_block_start < start
-                            ):
-                                last_failed_block_start = start
+                            last_failed_block_start = earliest_failed_start(
+                                last_failed_block_start, start
+                            )
                             break
 
                         self.gpu_connector.to_gpu(
@@ -1995,13 +2112,9 @@ class LMCacheEngine:
                 t_cpu_total = time.perf_counter() - t0_cpu
 
         # ---- Step 3: handle failures ----
-        if last_failed_block_start is not None:
-            ret_mask[last_failed_block_start:] = False
-            reordered_chunks = [
-                (key, memory_obj, start, end)
-                for key, memory_obj, start, end in reordered_chunks
-                if end < last_failed_block_start
-            ]
+        reordered_chunks, tot_kv_size = truncate_to_prefix(
+            ret_mask, reordered_chunks, tot_kv_size, last_failed_block_start
+        )
 
         # ---- Profiling summary ----
         t_retrieve_total = time.perf_counter() - t_retrieve_start
@@ -2157,11 +2270,9 @@ class LMCacheEngine:
                         "KVStream overlapped: key missing "
                         "from disk cache during load"
                     )
-                    if (
-                        state.last_failed_block_start is None
-                        or state.last_failed_block_start < start
-                    ):
-                        state.last_failed_block_start = start
+                    state.last_failed_block_start = earliest_failed_start(
+                        state.last_failed_block_start, start
+                    )
                     break
                 io_hash, _, _memory_obj = entry
                 state.group_to_block[io_hash] = (key, start, end)
@@ -2205,11 +2316,9 @@ class LMCacheEngine:
                             "The cache block is in the storage, "
                             "but it can't be retrieved"
                         )
-                        if (
-                            state.last_failed_block_start is None
-                            or state.last_failed_block_start < start
-                        ):
-                            state.last_failed_block_start = start
+                        state.last_failed_block_start = earliest_failed_start(
+                            state.last_failed_block_start, start
+                        )
                         break
 
                     self.gpu_connector.to_gpu(
@@ -2321,14 +2430,12 @@ class LMCacheEngine:
             state.t_gpu_sync = time.perf_counter() - t_sync_start
 
         # Handle failures
-        if state.last_failed_block_start is not None:
-            state.ret_mask[state.last_failed_block_start:] = False
-            state.reordered_chunks = [
-                (key, memory_obj, start, end)
-                for key, memory_obj, start, end
-                in state.reordered_chunks
-                if end < state.last_failed_block_start
-            ]
+        state.reordered_chunks, state.tot_kv_size = truncate_to_prefix(
+            state.ret_mask,
+            state.reordered_chunks,
+            state.tot_kv_size,
+            state.last_failed_block_start,
+        )
 
         # Profiling summary
         t_retrieve_total = time.perf_counter() - state.t0

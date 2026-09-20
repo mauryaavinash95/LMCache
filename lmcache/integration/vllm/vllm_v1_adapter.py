@@ -38,7 +38,11 @@ from lmcache.integration.vllm.utils import (
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
-from lmcache.v1.cache_engine import LMCacheEngine, OverlappedRetrieveState
+from lmcache.v1.cache_engine import (
+    LMCacheEngine,
+    OverlappedRetrieveState,
+    earliest_failed_start,
+)
 from lmcache.v1.hash_tracer import RequestHashTracer
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
@@ -627,6 +631,17 @@ class LMCacheConnectorV1Impl:
         self._store_emit_time: float = 0.0  # tracer.emit() calls
         self._store_d2h_time: float = 0.0    # GPU->CPU copy inside store()
         self._store_alloc_time: float = 0.0  # host-buffer allocate inside store()
+        # ---- Residual attribution ----
+        # The four accumulators above left ~95% of the store phase in an
+        # unattributed "other" bucket, which made the write-saturation
+        # collapse impossible to localise.  These cover the remaining work
+        # in the per-request loop, so ``store_other`` becomes a genuine
+        # remainder rather than the whole phase.
+        self._store_backlog_time: float = 0.0  # entry backlog snapshot (locks)
+        self._store_slotmap_time: float = 0.0  # slot_mapping H2D copy
+        self._store_mask_time: float = 0.0     # store_mask build + align slice
+        self._store_tracer_time: float = 0.0   # hash-trace key rebuild
+        self._store_reqs: int = 0              # requests in the store loop
         # End-of-forward sync wait (leaked async prefill compute), seconds.
         self._step_fwd_sync: float = 0.0
         # Backlog snapshot taken at entry of wait_for_save.
@@ -1261,14 +1276,39 @@ class LMCacheConnectorV1Impl:
                             completed_global += 1
                             continue
                         if memory_obj is None:
-                            # The read failed.  Mark the whole request as
-                            # un-retrieved rather than leaving a hole in
-                            # ret_mask: vLLM expresses a prefix hit as a
-                            # single token count, so a gap in the middle
-                            # cannot be represented and would silently
-                            # present garbage KV as cached.  Recomputing
-                            # one prefix is cheap next to that.
-                            failed_states.add(id(tgt))
+                            # The read failed.  Record where, and let
+                            # finalize truncate the prefix at the earliest
+                            # failure -- the same path a key missing from
+                            # the disk index already takes.
+                            #
+                            # Zeroing the whole mask here instead looked
+                            # safer but was strictly worse: vLLM has
+                            # already committed to lmcache_cached_tokens
+                            # and allocated blocks for them, and the
+                            # connector cannot retract that claim.
+                            # Reporting zero retrieved tokens makes
+                            # record_failed_blocks mark the request's
+                            # entire block set invalid, and the resulting
+                            # re-plan desynchronises the tracker's
+                            # allocated_block_ids from its token_ids --
+                            # which trips the slot_mapping/token_ids
+                            # assertion in wait_for_save and takes the
+                            # engine down.  Truncating keeps the claim
+                            # monotonic: everything before the failure is
+                            # still genuinely cached.
+                            blk = tgt.group_to_block.get(group_hash)
+                            if blk is not None:
+                                _, fstart, _fend = blk
+                                tgt.last_failed_block_start = (
+                                    earliest_failed_start(
+                                        tgt.last_failed_block_start,
+                                        fstart,
+                                    )
+                                )
+                            else:
+                                # No offset to truncate at; fall back to
+                                # dropping the whole prefix for safety.
+                                failed_states.add(id(tgt))
                             completed_global += 1
                             continue
                         t_now = time.perf_counter()
@@ -1306,9 +1346,10 @@ class LMCacheConnectorV1Impl:
         # ---- Phase 4: finalize ALL requests ----
         for request, state, num_expected in request_states:
             if id(state) in failed_states:
-                # At least one chunk of this request could not be read.
-                # Drop the whole prefix so the engine recomputes it.
+                # A failure we could not attribute to a token offset.
+                # Nothing to truncate at, so drop the whole prefix.
                 state.ret_mask[:] = False
+                state.last_failed_block_start = 0
             lmcache_cached_tokens = (
                 request.load_spec.lmcache_cached_tokens
             )
@@ -1610,8 +1651,18 @@ class LMCacheConnectorV1Impl:
         self._store_emit_time = 0.0
         self._store_d2h_time = 0.0
         self._store_alloc_time = 0.0
+        self._store_backlog_time = 0.0
+        self._store_slotmap_time = 0.0
+        self._store_mask_time = 0.0
+        self._store_tracer_time = 0.0
+        self._store_reqs = 0
         self._store_backlog_stats = {}
         if self._store_profiling_enabled and self._kvstream_backend is not None:
+            # Timed: this takes put_tasks_lock, then disk_lock, then
+            # _counter_lock, and the drain thread holds disk_lock every
+            # drain_poll_interval.  Under write saturation the wait here
+            # is not obviously negligible, and it sits inside store_ms.
+            _tb = time.perf_counter()
             try:
                 self._store_backlog_stats = (
                     self._kvstream_backend.get_write_backlog_stats()
@@ -1619,6 +1670,7 @@ class LMCacheConnectorV1Impl:
             except AttributeError:
                 # Backend variant without backlog stats (e.g. disk backend).
                 self._store_backlog_stats = {}
+            self._store_backlog_time = time.perf_counter() - _tb
 
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
@@ -1664,6 +1716,7 @@ class LMCacheConnectorV1Impl:
                     _tracer.emit()
                 continue
 
+            self._store_reqs += 1
             token_ids = request.token_ids
 
             slot_mapping = request.slot_mapping
@@ -1671,7 +1724,10 @@ class LMCacheConnectorV1Impl:
             assert len(slot_mapping) == len(token_ids)
 
             # TODO: have a pre-allocated buffer to hold the slot_mappings
+            _tsm = time.perf_counter() if self._store_profiling_enabled else 0.0
             slot_mapping = slot_mapping.to(self.device)
+            if self._store_profiling_enabled:
+                self._store_slotmap_time += time.perf_counter() - _tsm
 
             skip_leading_tokens = save_spec.skip_leading_tokens
             # shared storage disaggregation will not have a disagg_spec passed in
@@ -1695,8 +1751,11 @@ class LMCacheConnectorV1Impl:
                 * self._lmcache_chunk_size
             )
 
+            _tmk = time.perf_counter() if self._store_profiling_enabled else 0.0
             store_mask = torch.ones(len(token_ids), dtype=torch.bool)
             store_mask[:skip_leading_tokens] = False
+            if self._store_profiling_enabled:
+                self._store_mask_time += time.perf_counter() - _tmk
 
             logger.debug(
                 "Storing KV cache for %d out of %d tokens "
@@ -1713,6 +1772,11 @@ class LMCacheConnectorV1Impl:
                     request.disagg_spec.is_last_prefill = True
             else:
                 if not self.enable_blending:
+                    _tal = (
+                        time.perf_counter()
+                        if self._store_profiling_enabled
+                        else 0.0
+                    )
                     token_len = len(token_ids)
                     aligned_token_len = (
                         token_len // self._lmcache_chunk_size * self._lmcache_chunk_size
@@ -1720,12 +1784,22 @@ class LMCacheConnectorV1Impl:
                     token_ids = token_ids[:aligned_token_len]
                     store_mask = store_mask[:aligned_token_len]
                     slot_mapping = slot_mapping[:aligned_token_len]
+                    if self._store_profiling_enabled:
+                        self._store_mask_time += time.perf_counter() - _tal
 
             # Hash tracing: ensure tracer exists for store-only requests
             if (
                 self._hash_trace_enabled
                 and request.req_id not in self.lmcache_engine.hash_tracers
             ):
+                # Rebuilding every chunk key re-hashes the whole sequence
+                # (O(tokens)) per request, on the critical path.  Timed
+                # separately from the tier-presence probe that follows it.
+                _tht = (
+                    time.perf_counter()
+                    if self._store_profiling_enabled
+                    else 0.0
+                )
                 _tracer = RequestHashTracer(
                     req_id=request.req_id,
                     chunk_size=self._lmcache_chunk_size,
@@ -1740,6 +1814,8 @@ class LMCacheConnectorV1Impl:
                 ]
                 _all_hashes = [k.chunk_hash for k in _all_keys_store]
                 _tracer.set_all_hashes(_all_hashes, len(request.token_ids))
+                if self._store_profiling_enabled:
+                    self._store_tracer_time += time.perf_counter() - _tht
 
                 # Probe tier presence for store-only requests too.
                 # This is O(chunks x backends) contains() calls (each may
@@ -1854,6 +1930,17 @@ class LMCacheConnectorV1Impl:
                 f"/{ts['read_elapsed_ms']}ms"
                 f"/{ts['read_ops']}ops"
             )
+            # Read-failure discriminators.  retries/failure ratio separates
+            # the classes: ~max_retries per failure => zero-length reads,
+            # exactly 1 => unaligned remainder, 0 => hard kernel error.
+            # Emitted only when something actually went wrong.
+            if ts.get("read_ops_failed", 0) or ts.get("read_ring_full_waits", 0):
+                tier_parts += (
+                    f" t{ts['tier']}_rdfail={ts.get('read_ops_failed', 0)}"
+                    f"/retry={ts.get('read_retries', 0)}"
+                    f"/ringfull={ts.get('read_ring_full_waits', 0)}"
+                    f"/sqes={ts.get('read_sqes_submitted', 0)}"
+                )
             if ts.get("write_bytes", 0) > 0:
                 tier_parts += (
                     f" t{ts['tier']}"
@@ -1863,12 +1950,19 @@ class LMCacheConnectorV1Impl:
                     f"/{ts['write_ops']}ops"
                 )
 
-        # Phase-1 store-phase decomposition + write-backlog suffix.
-        # ``store_ms`` is decomposed into: store()-call time (which itself
-        # contains allocate/D2H/put), the hash-trace tier-presence probe,
-        # unpin, emit, and an ``other`` residual (bookkeeping not covered
-        # above). The backlog snapshot (taken at entry) shows the pinning
-        # pressure the store's allocate() faced.
+        # Store-phase decomposition + write-backlog suffix.
+        # ``store_ms`` covers the whole of wait_for_save and is decomposed
+        # into: store()-call time (which itself contains allocate/D2H/put),
+        # the entry backlog snapshot, the slot_mapping H2D copy, store-mask
+        # construction, hash-trace key rebuild, the tier-presence probe,
+        # unpin, emit, and an ``other`` residual.
+        #
+        # The first six of those were added because ``other`` was ~95% of
+        # the phase (670 ms of 782 ms at the arrival rate where the write
+        # path saturates), which made the collapse impossible to localise.
+        # ``store_other`` should now be small; if it is not, the remaining
+        # time is outside the per-request loop.  The backlog snapshot
+        # (taken at entry) shows the pressure the store's allocate() faced.
         store_parts = ""
         if self._store_profiling_enabled:
             probe_ms = self._store_probe_time * 1e3
@@ -1877,7 +1971,15 @@ class LMCacheConnectorV1Impl:
             emit_ms = self._store_emit_time * 1e3
             d2h_ms = self._store_d2h_time * 1e3
             alloc_ms = self._store_alloc_time * 1e3
-            other_ms = store_ms - (probe_ms + unpin_ms + call_ms + emit_ms)
+            backlog_ms = self._store_backlog_time * 1e3
+            slotmap_ms = self._store_slotmap_time * 1e3
+            mask_ms = self._store_mask_time * 1e3
+            tracer_ms = self._store_tracer_time * 1e3
+            nreq = self._store_reqs
+            other_ms = store_ms - (
+                probe_ms + unpin_ms + call_ms + emit_ms
+                + backlog_ms + slotmap_ms + mask_ms + tracer_ms
+            )
             store_parts = (
                 f" fwd_sync={self._step_fwd_sync * 1e3:.1f}ms"
                 f" store_call={call_ms:.1f}ms"
@@ -1886,8 +1988,21 @@ class LMCacheConnectorV1Impl:
                 f" store_probe={probe_ms:.1f}ms"
                 f" store_unpin={unpin_ms:.1f}ms"
                 f" store_emit={emit_ms:.1f}ms"
+                f" store_backlog={backlog_ms:.1f}ms"
+                f" store_slotmap={slotmap_ms:.1f}ms"
+                f" store_mask={mask_ms:.1f}ms"
+                f" store_tracer={tracer_ms:.1f}ms"
+                f" store_reqs={nreq}"
                 f" store_other={other_ms:.1f}ms"
             )
+            # Per-request means: a residual that scales with request count
+            # points at the loop body; one that does not points at
+            # something outside it.
+            if nreq > 0:
+                store_parts += (
+                    f" store_per_req={(store_ms / nreq):.1f}ms"
+                    f" store_other_per_req={(other_ms / nreq):.1f}ms"
+                )
             b = self._store_backlog_stats
             if b:
                 store_parts += (
@@ -1923,6 +2038,16 @@ class LMCacheConnectorV1Impl:
                     # transient I/O errors are actually a rate.
                     f" rd_fail={b.get('read_failures', 0)}"
                 )
+                # Why they failed.  Emitted only when non-empty so the
+                # common (healthy) line stays unchanged.  Each tag points
+                # at a different root cause -- see _read_failure_tag.
+                _reasons = b.get("read_failure_reasons") or {}
+                if _reasons:
+                    _r = ",".join(
+                        f"{k}:{v}"
+                        for k, v in sorted(_reasons.items())
+                    )
+                    store_parts += f" rd_fail_why={_r}"
 
         # Overlap-aware read/write timeline + delta-band write metrics.
         # ``get_io_timeline_and_reset`` drains the C++ per-op intervals for
@@ -2508,6 +2633,32 @@ class LMCacheConnectorV1Impl:
             self.lookup_client.cancel_lookup(  # type: ignore[attr-defined]
                 lookup_id
             )
+
+        # Release lookup pins for requests that never reached wait_for_save.
+        #
+        # lookup() pins every hit so it survives until the worker loads it,
+        # and wait_for_save is what normally releases them.  A request that
+        # is looked up and then aborted, or finished without ever being
+        # stored, never gets there -- so its pins (and its lookup_pins
+        # entry) leaked for the lifetime of the process, making those
+        # chunks permanently unevictable.  Both releases are idempotent, so
+        # whichever runs first wins and the other is a no-op.
+        #
+        # This only reaches the pins when the scheduler owns the engine
+        # (enable_scheduler_bypass_lookup).  In the default deployment the
+        # pins live in the worker process and there is no unpin RPC, so the
+        # worker-side cap in LMCacheEngine._release_orphaned_lookup_pins is
+        # what bounds the leak there.
+        if self.lmcache_engine is not None:
+            try:
+                self.lmcache_engine.lookup_unpin(request.request_id)
+            except Exception:
+                # Teardown must not raise: vLLM has already finished the
+                # request and cannot act on an error here.
+                logger.exception(
+                    "lookup_unpin failed for finished request %s",
+                    request.request_id,
+                )
 
         params = (
             request.kv_transfer_params
