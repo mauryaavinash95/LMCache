@@ -675,7 +675,16 @@ class LMCacheConnectorV1Impl:
         # in the per-request loop, so ``store_other`` becomes a genuine
         # remainder rather than the whole phase.
         self._store_backlog_time: float = 0.0  # entry backlog snapshot (locks)
-        self._store_slotmap_time: float = 0.0  # slot_mapping H2D copy
+        # slot_mapping.to(device). Named for what it measures, not for the
+        # statement it wraps: the tensor is ~8 bytes/token (~72 KB for a
+        # typical step, ~72 us to copy), but the source is pageable, so the
+        # transfer is host-synchronous and blocks until the stream drains.
+        # It is therefore the first synchronizing CUDA call after the forward
+        # launch and absorbs the async prefill -- measured at 667-724 ms and
+        # FLAT in both token count and request count, i.e. not transfer work.
+        # `forward` only times the launch. Set kvstream_phase_sync=True to
+        # move this wait into fwd_sync where it belongs.
+        self._store_gpu_sync_time: float = 0.0
         self._store_mask_time: float = 0.0     # store_mask build + align slice
         self._store_tracer_time: float = 0.0   # hash-trace key rebuild
         self._store_reqs: int = 0              # requests in the store loop
@@ -1689,7 +1698,7 @@ class LMCacheConnectorV1Impl:
         self._store_d2h_time = 0.0
         self._store_alloc_time = 0.0
         self._store_backlog_time = 0.0
-        self._store_slotmap_time = 0.0
+        self._store_gpu_sync_time = 0.0
         self._store_mask_time = 0.0
         self._store_tracer_time = 0.0
         self._store_reqs = 0
@@ -1760,11 +1769,14 @@ class LMCacheConnectorV1Impl:
             assert isinstance(slot_mapping, torch.Tensor)
             assert len(slot_mapping) == len(token_ids)
 
-            # TODO: have a pre-allocated buffer to hold the slot_mappings
+            # TODO: have a pre-allocated buffer to hold the slot_mappings.
+            # Doing so would also stop this line acting as an accidental
+            # barrier: the source is pageable, so the copy is
+            # host-synchronous and waits for the whole queued forward.
             _tsm = time.perf_counter() if self._store_profiling_enabled else 0.0
             slot_mapping = slot_mapping.to(self.device)
             if self._store_profiling_enabled:
-                self._store_slotmap_time += time.perf_counter() - _tsm
+                self._store_gpu_sync_time += time.perf_counter() - _tsm
 
             skip_leading_tokens = save_spec.skip_leading_tokens
             # shared storage disaggregation will not have a disagg_spec passed in
@@ -2009,13 +2021,13 @@ class LMCacheConnectorV1Impl:
             d2h_ms = self._store_d2h_time * 1e3
             alloc_ms = self._store_alloc_time * 1e3
             backlog_ms = self._store_backlog_time * 1e3
-            slotmap_ms = self._store_slotmap_time * 1e3
+            gpu_sync_ms = self._store_gpu_sync_time * 1e3
             mask_ms = self._store_mask_time * 1e3
             tracer_ms = self._store_tracer_time * 1e3
             nreq = self._store_reqs
             other_ms = store_ms - (
                 probe_ms + unpin_ms + call_ms + emit_ms
-                + backlog_ms + slotmap_ms + mask_ms + tracer_ms
+                + backlog_ms + gpu_sync_ms + mask_ms + tracer_ms
             )
             store_parts = (
                 f" fwd_sync={self._step_fwd_sync * 1e3:.1f}ms"
@@ -2026,7 +2038,7 @@ class LMCacheConnectorV1Impl:
                 f" store_unpin={unpin_ms:.1f}ms"
                 f" store_emit={emit_ms:.1f}ms"
                 f" store_backlog={backlog_ms:.1f}ms"
-                f" store_slotmap={slotmap_ms:.1f}ms"
+                f" store_gpu_sync={gpu_sync_ms:.1f}ms"
                 f" store_mask={mask_ms:.1f}ms"
                 f" store_tracer={tracer_ms:.1f}ms"
                 f" store_reqs={nreq}"
