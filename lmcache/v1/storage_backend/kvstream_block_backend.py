@@ -261,11 +261,12 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         # -- Primary directory -------------------------------------------
         assert config.local_disk is not None
         self.path: str = config.local_disk
-        if not os.path.exists(self.path):
-            os.makedirs(self.path)
-            logger.info(
-                "Created KVStream disk cache directory: %s", self.path
-            )
+        # exist_ok, not a prior exists() check: every TP rank constructs a
+        # backend concurrently against the same directory, so the check and
+        # the create are a race. Losing it raises EEXIST out of __init__,
+        # which LMCacheManager turns into mark_init_failed() -- silently
+        # disabling the cache on that rank for the whole run.
+        os.makedirs(self.path, exist_ok=True)
 
 
         # -- Capacity tracking -------------------------------------------
@@ -333,11 +334,11 @@ class KVStreamBlockReplicatedBackend(StorageBackendInterface):
         # variants that isolate the contribution of multi-path replication.
         pfs_path: str = str(extra.get("kvstream_tier_1_path", ""))
         self._num_tiers: int = 2 if pfs_path else 1
-        if pfs_path and not os.path.exists(pfs_path):
-            os.makedirs(pfs_path)
-            logger.info(
-                "Created KVStream PFS tier directory: %s", pfs_path
-            )
+        if pfs_path:
+            # Same race as above, and worse here: all four TP ranks share
+            # one PFS directory, and Lustre makes the exists() result
+            # stale often enough that three of them can lose it at once.
+            os.makedirs(pfs_path, exist_ok=True)
 
         # -- Build tier engines (1 or 2 depending on PFS availability) ---
         if self._num_tiers == 2:
